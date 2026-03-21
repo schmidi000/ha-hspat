@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+
+# Build cache & temp
+.rollup.cache/
+*.tsbuildinfo
+
+# TypeScript declaration emit (dist/ keeps only the bundled JS)
+dist/**/*.d.ts
+dist/**/*.d.ts.map
+dist/components/
+dist/modules/
+dist/workers/
+dist/constants.*
+dist/types.*
+dist/hspat-card.d.ts
+
+# Test output
+coverage/
+
+# Editor & OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Claude Code session files (not needed in repo)
+CLAUDE.md
+
+# Docs are kept locally only (referenced from CLAUDE.md)
+docs/
