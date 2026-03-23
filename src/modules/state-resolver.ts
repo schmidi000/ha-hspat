@@ -22,6 +22,8 @@ export function buildCostMatrix(
 
   // 2. Apply point sensor dynamic modification
   for (const ps of config.point_sensors) {
+    // Skip sensors that haven't been placed on the map yet
+    if (ps.tile_x < 0 || ps.tile_y < 0) continue;
     const snap = snapshots.find(s => s.sensor_id === ps.id);
     const isOnline = snap?.health === 'active';
     const rawState = getEntityState(hass, ps.entity_id);

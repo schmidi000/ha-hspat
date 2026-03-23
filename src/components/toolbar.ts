@@ -1,11 +1,13 @@
 import { LitElement, html, css } from 'lit';
-import { customElement, property } from 'lit/decorators.js';
+import { customElement, property, state } from 'lit/decorators.js';
 import { TileType } from '../types.js';
 import type { Floor } from '../types.js';
 
 export type PaintMode = 'setup' | 'paint' | 'hardware' | 'audit';
 export type BrushType = TileType.Open | TileType.Wall | TileType.Door | TileType.Window | TileType.Perimeter | TileType.Valuable | TileType.Stair;
+/** @deprecated Vector mode has been removed. Only 'pixel' is used. */
 export type DrawMode = 'pixel' | 'vector';
+/** @deprecated Vector shapes have been removed. */
 export type VectorShapeType = 'line' | 'rect';
 
 @customElement('hspat-toolbar')
@@ -15,8 +17,8 @@ export class Toolbar extends LitElement {
   @property({ type: Array }) floors: Floor[] = [];
   @property() activeFloorId = '';
   @property({ type: Boolean }) showGrid = true;
-  @property() drawMode: DrawMode = 'pixel';
-  @property() vectorShapeType: VectorShapeType = 'rect';
+  @property({ type: Boolean }) canUndo = false;
+  @property({ type: Boolean }) canRedo = false;
 
   static styles = css`
     :host {
@@ -125,7 +127,14 @@ export class Toolbar extends LitElement {
       border-color: var(--primary-color, #03a9f4);
       color: var(--primary-color, #03a9f4);
     }
-    .draw-mode-row {
+    .brush-tooltip {
+      font-size: 0.72rem;
+      color: var(--secondary-text-color, #888);
+      margin-top: 4px;
+      padding: 2px 4px;
+      line-height: 1.35;
+    }
+    .undo-row {
       display: flex;
       gap: 4px;
     }
@@ -161,33 +170,31 @@ export class Toolbar extends LitElement {
     this.dispatchEvent(new CustomEvent('grid-toggle', { detail: next, bubbles: true, composed: true }));
   }
 
-  private _setDrawMode(m: DrawMode) {
-    this.drawMode = m;
-    this.dispatchEvent(new CustomEvent('draw-mode-change', { detail: m, bubbles: true, composed: true }));
+  private _undo() {
+    this.dispatchEvent(new CustomEvent('undo-action', { bubbles: true, composed: true }));
   }
 
-  private _setVectorShape(t: VectorShapeType) {
-    this.vectorShapeType = t;
-    this.dispatchEvent(new CustomEvent('vector-shape-change', { detail: t, bubbles: true, composed: true }));
+  private _redo() {
+    this.dispatchEvent(new CustomEvent('redo-action', { bubbles: true, composed: true }));
   }
 
   private get _brushes(): Array<{ type: BrushType; label: string; colour: string; tip: string }> {
     return [
-      { type: TileType.Open,      label: 'Open',      colour: 'rgba(0,160,0,0.7)',    tip: 'Walkable floor / open space' },
-      { type: TileType.Wall,      label: 'Wall',      colour: 'rgba(50,50,50,0.85)',  tip: 'Solid wall — impassable' },
-      { type: TileType.Door,      label: 'Door',      colour: 'rgba(255,140,0,0.85)', tip: 'Door — entry point with higher cost' },
-      { type: TileType.Window,    label: 'Window',    colour: 'rgba(0,100,255,0.75)', tip: 'Window — breach point (lower cost than door)' },
-      { type: TileType.Perimeter, label: 'Perimeter', colour: 'rgba(200,0,0,0.8)',    tip: 'Outer boundary — where an intruder could enter from' },
-      { type: TileType.Valuable,  label: 'Valuable',  colour: 'rgba(200,160,0,0.85)', tip: "Item worth protecting — the intruder's target" },
-      { type: TileType.Stair,     label: 'Stairs',    colour: 'rgba(139,92,246,0.85)', tip: 'Staircase — connects this floor to another floor' },
+      { type: TileType.Open,      label: 'Open',      colour: 'rgba(0,160,0,0.7)',    tip: 'Interior walkable space (e.g. rooms, corridors). Intruders can move freely through these tiles.' },
+      { type: TileType.Wall,      label: 'Wall',      colour: 'rgba(50,50,50,0.85)',  tip: 'Solid wall — impassable to intruders and blocks sensor line-of-sight.' },
+      { type: TileType.Door,      label: 'Door',      colour: 'rgba(255,140,0,0.85)', tip: 'Door tile — a passage point that costs more to move through. Attach a door sensor here.' },
+      { type: TileType.Window,    label: 'Window',    colour: 'rgba(0,100,255,0.75)', tip: 'Window tile — a breach point, easier to enter than a door. Attach a window sensor here.' },
+      { type: TileType.Perimeter, label: 'Perimeter', colour: 'rgba(200,0,0,0.8)',    tip: 'Exterior boundary tile — marks where an intruder could enter from outside (e.g. an exterior wall face, garden edge). Unlike Open, these are potential starting points for the intruder simulation.' },
+      { type: TileType.Valuable,  label: 'Valuable',  colour: 'rgba(200,160,0,0.85)', tip: "High-value target tile (e.g. safe, server, jewellery). The simulation models intruders heading here from Perimeter tiles." },
+      { type: TileType.Stair,     label: 'Stairs',    colour: 'rgba(139,92,246,0.85)', tip: 'Staircase — connects this floor to another floor. After placing, link it to a stair on another floor.' },
     ];
   }
 
   private readonly _modeLabels: Record<PaintMode, string> = {
-    setup:    'Setup',
-    paint:    'Draw Floor Plan',
-    hardware: 'Sensors',
-    audit:    'Audit',
+    setup:    '\u2699 Setup',
+    paint:    '\u270F Draw',
+    hardware: '\uD83D\uDCE1 Sensors',
+    audit:    '\uD83D\uDEE1 Audit',
   };
 
   render() {
@@ -226,35 +233,22 @@ export class Toolbar extends LitElement {
         </div>
       </div>
 
-      <!-- Row 3: brush row + draw-mode toggle (paint mode only) -->
+      <!-- Row 3: brush row (paint mode only) -->
       ${this.mode === 'paint' ? html`
         <div class="row">
-          <div class="draw-mode-row">
+          <div class="undo-row">
             <button
-              class=${this.drawMode === 'pixel' ? 'active' : ''}
-              title="Paint individual tiles"
-              @click=${() => this._setDrawMode('pixel')}
-            >Pixel</button>
+              title="Undo (Ctrl+Z)"
+              ?disabled=${!this.canUndo}
+              @click=${this._undo}
+            >&#8617; Undo</button>
             <button
-              class=${this.drawMode === 'vector' ? 'active' : ''}
-              title="Draw vector shapes (auto-rasterized)"
-              @click=${() => this._setDrawMode('vector')}
-            >Vector</button>
+              title="Redo (Ctrl+Shift+Z)"
+              ?disabled=${!this.canRedo}
+              @click=${this._redo}
+            >&#8618; Redo</button>
           </div>
-          ${this.drawMode === 'vector' ? html`
-            <div class="draw-mode-row">
-              <button
-                class=${this.vectorShapeType === 'rect' ? 'active' : ''}
-                title="Draw filled rectangles"
-                @click=${() => this._setVectorShape('rect')}
-              >Rect</button>
-              <button
-                class=${this.vectorShapeType === 'line' ? 'active' : ''}
-                title="Draw lines"
-                @click=${() => this._setVectorShape('line')}
-              >Line</button>
-            </div>
-          ` : ''}
+          <div class="separator"></div>
           <div class="brush-row">
             ${this._brushes.map(b => html`
               <button
@@ -265,7 +259,9 @@ export class Toolbar extends LitElement {
               >${b.label}</button>
             `)}
           </div>
-          <span class="brush-legend" title=${this._brushes.find(b => b.type === this.brush)?.tip ?? ''}>
+        </div>
+        <div class="row">
+          <span class="brush-tooltip">
             ${this._brushes.find(b => b.type === this.brush)?.tip ?? ''}
           </span>
         </div>

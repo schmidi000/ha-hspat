@@ -1,7 +1,7 @@
 import * as ROT from 'rot-js';
 import { TileType } from '../types.js';
 import { SENSOR_PENALTY } from '../constants.js';
-import type { AreaSensor, SensorSnapshot } from '../types.js';
+import type { AreaSensor, PointSensor, SensorSnapshot } from '../types.js';
 
 export interface FovTile { x: number; y: number; }
 
@@ -22,7 +22,7 @@ export function computeSensorFov(
 
   const lightPasses = (x: number, y: number): boolean => {
     const tile = grid[y]?.[x] ?? TileType.Wall;
-    return tile === TileType.Open || tile === TileType.Window;
+    return tile === TileType.Open || tile === TileType.Window || tile === TileType.Stair;
   };
 
   const fov = new ROT.FOV.PreciseShadowcasting(lightPasses);
@@ -68,6 +68,8 @@ export function computeAllFov(
   const coverage = new Set<string>();
 
   for (const sensor of sensors) {
+    // Skip sensors that haven't been placed on the map yet
+    if (sensor.grid_x < 0 || sensor.grid_y < 0) continue;
     const snap = snapshots.find(s => s.sensor_id === sensor.id);
     if (snap?.health !== 'active') continue;
 
@@ -77,6 +79,23 @@ export function computeAllFov(
   }
 
   return coverage;
+}
+
+/**
+ * Add point sensor tile positions to the coverage set.
+ * A placed, active point sensor "covers" its own tile (the door or window it monitors).
+ */
+export function addPointSensorCoverage(
+  sensors: PointSensor[],
+  snapshots: SensorSnapshot[],
+  coverage: Set<string>,
+): void {
+  for (const ps of sensors) {
+    if (ps.tile_x < 0 || ps.tile_y < 0) continue;
+    const snap = snapshots.find(s => s.sensor_id === ps.id);
+    if (snap?.health !== 'active') continue;
+    coverage.add(`${ps.tile_x},${ps.tile_y}`);
+  }
 }
 
 /**
@@ -90,6 +109,8 @@ export function applyAreaSensorCosts(
   snapshots: SensorSnapshot[],
 ): void {
   for (const sensor of sensors) {
+    // Skip sensors that haven't been placed on the map yet
+    if (sensor.grid_x < 0 || sensor.grid_y < 0) continue;
     const snap = snapshots.find(s => s.sensor_id === sensor.id);
     if (snap?.health !== 'active') continue;
 

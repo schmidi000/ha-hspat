@@ -24,7 +24,7 @@ export const TILE_COLOURS: Record<number, string> = {
   [TileType.Open]:      'rgba(0, 200, 0, 0.1)',
   [TileType.Window]:    'rgba(0, 100, 255, 0.4)',
   [TileType.Door]:      'rgba(255, 165, 0, 0.5)',
-  [TileType.Wall]:      'rgba(50, 50, 50, 0.8)',
+  [TileType.Wall]:      'rgba(50, 50, 50, 1.0)',
   [TileType.Perimeter]: 'rgba(255, 0, 0, 0.3)',
   [TileType.Valuable]:  'rgba(255, 215, 0, 0.5)',
   [TileType.Stair]:     'rgba(139, 92, 246, 0.75)', // purple

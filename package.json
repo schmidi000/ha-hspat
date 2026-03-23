@@ -14,7 +14,7 @@
     "test:coverage": "vitest run --coverage"
   },
   "keywords": [],
-  "author": "",
+  "author": "schmidi000 - https://github.com/schmidi000",
   "license": "ISC",
   "dependencies": {
     "lit": "^3.3.2",

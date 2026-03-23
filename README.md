@@ -63,7 +63,7 @@ type: custom:hspat-card
 grid_cols: 20
 grid_rows: 15
 grid_rle: ""
-floorplan_url: /local/floorplan.png   # optional background image
+floorplan_url: /local/floorplan/home.svg   # optional background image, stored in the www directory of home assistant
 disclaimer_accepted: false
 area_sensors:
   - id: area_1
@@ -106,6 +106,71 @@ perimeter:
 A sensor is marked **offline** (and excluded from analysis) when:
 - Its HA entity state is `unavailable` or `unknown`
 - Its battery entity reads below **5%**, or is `unavailable`/`unknown`
+
+---
+
+## Tutorial
+
+### Step 1 — Setup
+
+Open the card and switch to the **⚙ Setup** tab. Configure your floor's grid dimensions (columns × rows) and optionally paste a background floorplan image URL (e.g. `/local/floorplan/ground-floor.svg`). The image will be drawn behind the tile grid so you can trace your walls accurately.
+
+If you have multiple floors, use **+ Floor** to add them. When a new floor is added, the Ground Floor's wall layout is copied as a starting point — delete the interior room walls and keep the outer shell.
+
+![Setup tab](screenshots/tutorial-1-setup.png)
+*Background floorplan used from [ha-floorplan](https://github.com/ExperienceLovelace/ha-floorplan) (Apache 2.0)*
+
+---
+
+### Step 2 — Draw
+
+Switch to the **✏ Draw** tab. Select a brush from the toolbar and click (or drag) on the canvas to paint tiles:
+
+| Brush | Use for |
+|-------|---------|
+| **Open** | Walkable interior space — rooms, corridors |
+| **Wall** | Solid, impassable surfaces |
+| **Door** | Passable openings with higher traversal cost |
+| **Window** | Breach points easier to enter than a door |
+| **Perimeter** | Exterior boundary — potential entry points for the simulation |
+| **Valuable** | High-value targets the simulation routes intruders towards |
+| **Stairs** | Cross-floor connection tile |
+
+Use **Undo / Redo** (or Ctrl+Z / Ctrl+Shift+Z) to correct mistakes. Toggle the **Grid: ON/OFF** button to check the floorplan image underneath without the overlay.
+
+![Draw tab](screenshots/tutorial-2-draw.png)
+*Background floorplan used from [ha-floorplan](https://github.com/ExperienceLovelace/ha-floorplan) (Apache 2.0)*
+
+---
+
+### Step 3 — Sensors
+
+Switch to the **📡 Sensors** tab. Use the form on the right to add sensors:
+
+- **Area sensors** (cameras, PIR motion detectors) — specify the Home Assistant entity ID, the tile the sensor is mounted on, its facing angle (0° = East, 90° = South) and field-of-view cone width. Click **Place** to position it on the canvas.
+- **Point sensors** (door/window contacts) — specify the entity ID and the door or window tile it monitors.
+
+Right-click any sensor on the canvas to delete it. Sensor health (online/offline) is derived live from HA entity states and battery levels.
+
+![Sensors tab](screenshots/tutorial-3-sensors.png)
+*Background floorplan used from [ha-floorplan](https://github.com/ExperienceLovelace/ha-floorplan) (Apache 2.0)*
+
+---
+
+### Step 4 — Audit
+
+Switch to the **🛡 Audit** tab and click **Run Audit**. The card will:
+
+1. Snapshot all sensor states from Home Assistant
+2. Compute sensor FOV coverage using shadowcasting
+3. Run 150 Monte Carlo pathfinding iterations from every **Perimeter** tile to every **Valuable** tile
+4. Render a heatmap overlay (yellow → dark red = high traversal frequency)
+5. Display an insights panel highlighting unmonitored high-traffic zones
+
+Tiles never reached by any sensor's FOV are marked as blind spots. Use the results to reposition sensors or add new ones, then re-run the audit.
+
+![Audit tab](screenshots/tutorial-4-audit.png)
+*Background floorplan used from [ha-floorplan](https://github.com/ExperienceLovelace/ha-floorplan) (Apache 2.0)*
 
 ---
 

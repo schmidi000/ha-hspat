@@ -47,12 +47,15 @@ export function normalisedHeatmap(
  * Paint the full grid canvas:
  *  1. Clear
  *  2. Floorplan image (if available)
- *  3. Tile colours + optional grid lines
- *  4. Perimeter / Valuable config overlays
+ *  3. Non-wall tiles first pass
+ *  4. Perimeter / Valuable overlays (skip on wall tiles)
  *  5. Coverage overlay
  *  6. Heatmap overlay
- *  7. Sensor markers
- *  8. Placement cursor (when placing a sensor)
+ *  7. Wall tiles second pass (on top)
+ *  8. Grid lines (optional)
+ *  9. Stair glyphs
+ * 10. Sensor markers + hover highlight
+ * 11. Placement cursor (when placing a sensor)
  */
 export function paintGrid(
   ctx: CanvasRenderingContext2D,
@@ -63,6 +66,7 @@ export function paintGrid(
   floorplanImg: HTMLImageElement | null,
   placing: PlacingState = null,
   showGrid = true,
+  hoverTile: { x: number; y: number } | null = null,
 ): void {
   const { grid_cols, grid_rows } = config;
   const { width, height } = ctx.canvas;
@@ -73,21 +77,73 @@ export function paintGrid(
 
   // 1. Floorplan background
   if (floorplanImg?.complete) {
-    ctx.globalAlpha = 0.4;
+    ctx.globalAlpha = 0.6;
     ctx.drawImage(floorplanImg, 0, 0, width, height);
     ctx.globalAlpha = 1;
   }
 
-  // 2. Tile colours
+  // 2. Non-wall tiles (first pass)
   for (let row = 0; row < grid_rows; row++) {
     for (let col = 0; col < grid_cols; col++) {
       const tile = grid[row]?.[col] ?? TileType.Wall;
-      ctx.fillStyle = TILE_COLOURS[tile as TileType] ?? '#333';
+      if (tile === TileType.Wall) continue;
+      ctx.fillStyle = TILE_COLOURS[tile as TileType] ?? 'rgba(0,200,0,0.1)';
       ctx.fillRect(col * tileW, row * tileH, tileW, tileH);
     }
   }
 
-  // 3. Grid lines (optional)
+  // 3. Perimeter / Valuable config overlays (skip on wall tiles)
+  for (const t of config.perimeter ?? []) {
+    if ((grid[t.y]?.[t.x] ?? TileType.Wall) === TileType.Wall) continue;
+    ctx.fillStyle = TILE_COLOURS[TileType.Perimeter]!;
+    ctx.fillRect(t.x * tileW, t.y * tileH, tileW, tileH);
+    ctx.strokeStyle = 'rgba(255,0,0,0.8)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(t.x * tileW + 1, t.y * tileH + 1, tileW - 2, tileH - 2);
+  }
+  for (const t of config.valuables ?? []) {
+    if ((grid[t.y]?.[t.x] ?? TileType.Wall) === TileType.Wall) continue;
+    ctx.fillStyle = TILE_COLOURS[TileType.Valuable]!;
+    ctx.fillRect(t.x * tileW, t.y * tileH, tileW, tileH);
+    ctx.strokeStyle = 'rgba(255,180,0,0.9)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(t.x * tileW + 1, t.y * tileH + 1, tileW - 2, tileH - 2);
+  }
+
+  // 4. Coverage overlay
+  if (coverageTiles.size > 0) {
+    ctx.fillStyle = COVERAGE_COLOUR;
+    for (const key of coverageTiles) {
+      const [xs, ys] = key.split(',');
+      const x = parseInt(xs!, 10);
+      const y = parseInt(ys!, 10);
+      ctx.fillRect(x * tileW, y * tileH, tileW, tileH);
+    }
+  }
+
+  // 5. Heatmap overlay
+  if (heatmap.size > 0) {
+    const normed = normalisedHeatmap(heatmap);
+    for (const [key, t] of normed) {
+      const [xs, ys] = key.split(',');
+      const x = parseInt(xs!, 10);
+      const y = parseInt(ys!, 10);
+      ctx.fillStyle = heatColour(t);
+      ctx.fillRect(x * tileW, y * tileH, tileW, tileH);
+    }
+  }
+
+  // 6. Wall tiles (second pass — drawn on top for full opacity)
+  for (let row = 0; row < grid_rows; row++) {
+    for (let col = 0; col < grid_cols; col++) {
+      const tile = grid[row]?.[col] ?? TileType.Wall;
+      if (tile !== TileType.Wall) continue;
+      ctx.fillStyle = TILE_COLOURS[TileType.Wall]!;
+      ctx.fillRect(col * tileW, row * tileH, tileW, tileH);
+    }
+  }
+
+  // 7. Grid lines (optional)
   if (showGrid) {
     ctx.strokeStyle = 'rgba(0,0,0,0.1)';
     ctx.lineWidth = 0.5;
@@ -105,48 +161,7 @@ export function paintGrid(
     }
   }
 
-  // 4. Perimeter / Valuable config overlays
-  for (const t of config.perimeter ?? []) {
-    ctx.fillStyle = TILE_COLOURS[TileType.Perimeter]!;
-    ctx.fillRect(t.x * tileW, t.y * tileH, tileW, tileH);
-    // Diagonal-hatch border so they're visible on top of structural tiles
-    ctx.strokeStyle = 'rgba(255,0,0,0.8)';
-    ctx.lineWidth = 1.5;
-    ctx.strokeRect(t.x * tileW + 1, t.y * tileH + 1, tileW - 2, tileH - 2);
-  }
-  for (const t of config.valuables ?? []) {
-    ctx.fillStyle = TILE_COLOURS[TileType.Valuable]!;
-    ctx.fillRect(t.x * tileW, t.y * tileH, tileW, tileH);
-    // Gold border
-    ctx.strokeStyle = 'rgba(255,180,0,0.9)';
-    ctx.lineWidth = 1.5;
-    ctx.strokeRect(t.x * tileW + 1, t.y * tileH + 1, tileW - 2, tileH - 2);
-  }
-
-  // 5. Coverage overlay
-  if (coverageTiles.size > 0) {
-    ctx.fillStyle = COVERAGE_COLOUR;
-    for (const key of coverageTiles) {
-      const [xs, ys] = key.split(',');
-      const x = parseInt(xs!, 10);
-      const y = parseInt(ys!, 10);
-      ctx.fillRect(x * tileW, y * tileH, tileW, tileH);
-    }
-  }
-
-  // 6. Heatmap overlay
-  if (heatmap.size > 0) {
-    const normed = normalisedHeatmap(heatmap);
-    for (const [key, t] of normed) {
-      const [xs, ys] = key.split(',');
-      const x = parseInt(xs!, 10);
-      const y = parseInt(ys!, 10);
-      ctx.fillStyle = heatColour(t);
-      ctx.fillRect(x * tileW, y * tileH, tileW, tileH);
-    }
-  }
-
-  // 7. Stair glyphs — draw "↕" over every Stair tile so they are distinguishable at a glance
+  // 8. Stair glyphs
   {
     const fontSize = Math.max(8, Math.min(tileW, tileH) * 0.65);
     ctx.save();
@@ -157,18 +172,20 @@ export function paintGrid(
     for (let row = 0; row < grid_rows; row++) {
       for (let col = 0; col < grid_cols; col++) {
         if ((grid[row]?.[col] ?? -1) === TileType.Stair) {
-          ctx.fillText('↕', (col + 0.5) * tileW, (row + 0.5) * tileH);
+          ctx.fillText('\u2195', (col + 0.5) * tileW, (row + 0.5) * tileH);
         }
       }
     }
     ctx.restore();
   }
 
-  // 8. Sensor markers
+  // 9. Sensor markers
   const r = Math.min(tileW, tileH) * 0.38;
   for (const s of config.area_sensors ?? []) {
+    if (s.grid_x < 0 || s.grid_y < 0) continue;
     const cx = (s.grid_x + 0.5) * tileW;
     const cy = (s.grid_y + 0.5) * tileH;
+    const isHovered = hoverTile?.x === s.grid_x && hoverTile?.y === s.grid_y;
     ctx.fillStyle = placing?.id === s.id ? 'rgba(0,220,255,0.6)' : 'rgba(0,180,255,0.85)';
     ctx.beginPath();
     ctx.arc(cx, cy, r, 0, Math.PI * 2);
@@ -176,10 +193,19 @@ export function paintGrid(
     ctx.strokeStyle = '#fff';
     ctx.lineWidth = 1.5;
     ctx.stroke();
+    if (isHovered) {
+      ctx.strokeStyle = 'rgba(255,80,80,0.9)';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r + 4, 0, Math.PI * 2);
+      ctx.stroke();
+    }
   }
   for (const s of config.point_sensors ?? []) {
+    if (s.tile_x < 0 || s.tile_y < 0) continue;
     const cx = (s.tile_x + 0.5) * tileW;
     const cy = (s.tile_y + 0.5) * tileH;
+    const isHovered = hoverTile?.x === s.tile_x && hoverTile?.y === s.tile_y;
     ctx.fillStyle = placing?.id === s.id ? 'rgba(255,160,0,0.6)' : 'rgba(255,100,0,0.85)';
     ctx.beginPath();
     ctx.arc(cx, cy, r * 0.8, 0, Math.PI * 2);
@@ -187,9 +213,16 @@ export function paintGrid(
     ctx.strokeStyle = '#fff';
     ctx.lineWidth = 1.5;
     ctx.stroke();
+    if (isHovered) {
+      ctx.strokeStyle = 'rgba(255,80,80,0.9)';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r * 0.8 + 4, 0, Math.PI * 2);
+      ctx.stroke();
+    }
   }
 
-  // 8. Placement cursor hint
+  // 10. Placement cursor hint
   if (placing) {
     ctx.fillStyle = 'rgba(255,255,255,0.15)';
     ctx.fillRect(0, 0, width, height);

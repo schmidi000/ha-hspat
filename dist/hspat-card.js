@@ -150,7 +150,7 @@ const TILE_COLOURS = {
     [0 /* TileType.Open */]: 'rgba(0, 200, 0, 0.1)',
     [1 /* TileType.Window */]: 'rgba(0, 100, 255, 0.4)',
     [2 /* TileType.Door */]: 'rgba(255, 165, 0, 0.5)',
-    [3 /* TileType.Wall */]: 'rgba(50, 50, 50, 0.8)',
+    [3 /* TileType.Wall */]: 'rgba(50, 50, 50, 1.0)',
     [4 /* TileType.Perimeter */]: 'rgba(255, 0, 0, 0.3)',
     [5 /* TileType.Valuable */]: 'rgba(255, 215, 0, 0.5)',
     [6 /* TileType.Stair */]: 'rgba(139, 92, 246, 0.75)', // purple
@@ -209,6 +209,9 @@ function buildCostMatrix(grid, hass, config, snapshots) {
     const matrix = grid.map(row => row.map(tile => BASE_COST[tile] ?? 9999));
     // 2. Apply point sensor dynamic modification
     for (const ps of config.point_sensors) {
+        // Skip sensors that haven't been placed on the map yet
+        if (ps.tile_x < 0 || ps.tile_y < 0)
+            continue;
         const snap = snapshots.find(s => s.sensor_id === ps.id);
         const isOnline = snap?.health === 'active';
         const rawState = getEntityState(hass, ps.entity_id);
@@ -721,7 +724,7 @@ function computeSensorFov(grid, sensor) {
     const visibleTiles = [];
     const lightPasses = (x, y) => {
         const tile = grid[y]?.[x] ?? 3 /* TileType.Wall */;
-        return tile === 0 /* TileType.Open */ || tile === 1 /* TileType.Window */;
+        return tile === 0 /* TileType.Open */ || tile === 1 /* TileType.Window */ || tile === 6 /* TileType.Stair */;
     };
     const fov = new index.PreciseShadowcasting(lightPasses);
     fov.compute(sensor.grid_x, sensor.grid_y, sensor.max_range, (x, y, _r, _visibility) => {
@@ -751,6 +754,9 @@ function computeSensorFov(grid, sensor) {
 function computeAllFov(grid, sensors, snapshots) {
     const coverage = new Set();
     for (const sensor of sensors) {
+        // Skip sensors that haven't been placed on the map yet
+        if (sensor.grid_x < 0 || sensor.grid_y < 0)
+            continue;
         const snap = snapshots.find(s => s.sensor_id === sensor.id);
         if (snap?.health !== 'active')
             continue;
@@ -761,11 +767,28 @@ function computeAllFov(grid, sensors, snapshots) {
     return coverage;
 }
 /**
+ * Add point sensor tile positions to the coverage set.
+ * A placed, active point sensor "covers" its own tile (the door or window it monitors).
+ */
+function addPointSensorCoverage(sensors, snapshots, coverage) {
+    for (const ps of sensors) {
+        if (ps.tile_x < 0 || ps.tile_y < 0)
+            continue;
+        const snap = snapshots.find(s => s.sensor_id === ps.id);
+        if (snap?.health !== 'active')
+            continue;
+        coverage.add(`${ps.tile_x},${ps.tile_y}`);
+    }
+}
+/**
  * Apply area sensor traversal cost penalties to the cost matrix in-place.
  * Must be called AFTER buildCostMatrix (Phase 6) and AFTER computeAllFov.
  */
 function applyAreaSensorCosts(matrix, grid, sensors, snapshots) {
     for (const sensor of sensors) {
+        // Skip sensors that haven't been placed on the map yet
+        if (sensor.grid_x < 0 || sensor.grid_y < 0)
+            continue;
         const snap = snapshots.find(s => s.sensor_id === sensor.id);
         if (snap?.health !== 'active')
             continue;
@@ -853,14 +876,17 @@ function normalisedHeatmap(heatmap) {
  * Paint the full grid canvas:
  *  1. Clear
  *  2. Floorplan image (if available)
- *  3. Tile colours + optional grid lines
- *  4. Perimeter / Valuable config overlays
+ *  3. Non-wall tiles first pass
+ *  4. Perimeter / Valuable overlays (skip on wall tiles)
  *  5. Coverage overlay
  *  6. Heatmap overlay
- *  7. Sensor markers
- *  8. Placement cursor (when placing a sensor)
+ *  7. Wall tiles second pass (on top)
+ *  8. Grid lines (optional)
+ *  9. Stair glyphs
+ * 10. Sensor markers + hover highlight
+ * 11. Placement cursor (when placing a sensor)
  */
-function paintGrid(ctx, config, grid, coverageTiles, heatmap, floorplanImg, placing = null, showGrid = true) {
+function paintGrid(ctx, config, grid, coverageTiles, heatmap, floorplanImg, placing = null, showGrid = true, hoverTile = null) {
     const { grid_cols, grid_rows } = config;
     const { width, height } = ctx.canvas;
     const tileW = width / grid_cols;
@@ -868,19 +894,71 @@ function paintGrid(ctx, config, grid, coverageTiles, heatmap, floorplanImg, plac
     ctx.clearRect(0, 0, width, height);
     // 1. Floorplan background
     if (floorplanImg?.complete) {
-        ctx.globalAlpha = 0.4;
+        ctx.globalAlpha = 0.6;
         ctx.drawImage(floorplanImg, 0, 0, width, height);
         ctx.globalAlpha = 1;
     }
-    // 2. Tile colours
+    // 2. Non-wall tiles (first pass)
     for (let row = 0; row < grid_rows; row++) {
         for (let col = 0; col < grid_cols; col++) {
             const tile = grid[row]?.[col] ?? 3 /* TileType.Wall */;
-            ctx.fillStyle = TILE_COLOURS[tile] ?? '#333';
+            if (tile === 3 /* TileType.Wall */)
+                continue;
+            ctx.fillStyle = TILE_COLOURS[tile] ?? 'rgba(0,200,0,0.1)';
             ctx.fillRect(col * tileW, row * tileH, tileW, tileH);
         }
     }
-    // 3. Grid lines (optional)
+    // 3. Perimeter / Valuable config overlays (skip on wall tiles)
+    for (const t of config.perimeter ?? []) {
+        if ((grid[t.y]?.[t.x] ?? 3 /* TileType.Wall */) === 3 /* TileType.Wall */)
+            continue;
+        ctx.fillStyle = TILE_COLOURS[4 /* TileType.Perimeter */];
+        ctx.fillRect(t.x * tileW, t.y * tileH, tileW, tileH);
+        ctx.strokeStyle = 'rgba(255,0,0,0.8)';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(t.x * tileW + 1, t.y * tileH + 1, tileW - 2, tileH - 2);
+    }
+    for (const t of config.valuables ?? []) {
+        if ((grid[t.y]?.[t.x] ?? 3 /* TileType.Wall */) === 3 /* TileType.Wall */)
+            continue;
+        ctx.fillStyle = TILE_COLOURS[5 /* TileType.Valuable */];
+        ctx.fillRect(t.x * tileW, t.y * tileH, tileW, tileH);
+        ctx.strokeStyle = 'rgba(255,180,0,0.9)';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(t.x * tileW + 1, t.y * tileH + 1, tileW - 2, tileH - 2);
+    }
+    // 4. Coverage overlay
+    if (coverageTiles.size > 0) {
+        ctx.fillStyle = COVERAGE_COLOUR;
+        for (const key of coverageTiles) {
+            const [xs, ys] = key.split(',');
+            const x = parseInt(xs, 10);
+            const y = parseInt(ys, 10);
+            ctx.fillRect(x * tileW, y * tileH, tileW, tileH);
+        }
+    }
+    // 5. Heatmap overlay
+    if (heatmap.size > 0) {
+        const normed = normalisedHeatmap(heatmap);
+        for (const [key, t] of normed) {
+            const [xs, ys] = key.split(',');
+            const x = parseInt(xs, 10);
+            const y = parseInt(ys, 10);
+            ctx.fillStyle = heatColour(t);
+            ctx.fillRect(x * tileW, y * tileH, tileW, tileH);
+        }
+    }
+    // 6. Wall tiles (second pass — drawn on top for full opacity)
+    for (let row = 0; row < grid_rows; row++) {
+        for (let col = 0; col < grid_cols; col++) {
+            const tile = grid[row]?.[col] ?? 3 /* TileType.Wall */;
+            if (tile !== 3 /* TileType.Wall */)
+                continue;
+            ctx.fillStyle = TILE_COLOURS[3 /* TileType.Wall */];
+            ctx.fillRect(col * tileW, row * tileH, tileW, tileH);
+        }
+    }
+    // 7. Grid lines (optional)
     if (showGrid) {
         ctx.strokeStyle = 'rgba(0,0,0,0.1)';
         ctx.lineWidth = 0.5;
@@ -897,45 +975,7 @@ function paintGrid(ctx, config, grid, coverageTiles, heatmap, floorplanImg, plac
             ctx.stroke();
         }
     }
-    // 4. Perimeter / Valuable config overlays
-    for (const t of config.perimeter ?? []) {
-        ctx.fillStyle = TILE_COLOURS[4 /* TileType.Perimeter */];
-        ctx.fillRect(t.x * tileW, t.y * tileH, tileW, tileH);
-        // Diagonal-hatch border so they're visible on top of structural tiles
-        ctx.strokeStyle = 'rgba(255,0,0,0.8)';
-        ctx.lineWidth = 1.5;
-        ctx.strokeRect(t.x * tileW + 1, t.y * tileH + 1, tileW - 2, tileH - 2);
-    }
-    for (const t of config.valuables ?? []) {
-        ctx.fillStyle = TILE_COLOURS[5 /* TileType.Valuable */];
-        ctx.fillRect(t.x * tileW, t.y * tileH, tileW, tileH);
-        // Gold border
-        ctx.strokeStyle = 'rgba(255,180,0,0.9)';
-        ctx.lineWidth = 1.5;
-        ctx.strokeRect(t.x * tileW + 1, t.y * tileH + 1, tileW - 2, tileH - 2);
-    }
-    // 5. Coverage overlay
-    if (coverageTiles.size > 0) {
-        ctx.fillStyle = COVERAGE_COLOUR;
-        for (const key of coverageTiles) {
-            const [xs, ys] = key.split(',');
-            const x = parseInt(xs, 10);
-            const y = parseInt(ys, 10);
-            ctx.fillRect(x * tileW, y * tileH, tileW, tileH);
-        }
-    }
-    // 6. Heatmap overlay
-    if (heatmap.size > 0) {
-        const normed = normalisedHeatmap(heatmap);
-        for (const [key, t] of normed) {
-            const [xs, ys] = key.split(',');
-            const x = parseInt(xs, 10);
-            const y = parseInt(ys, 10);
-            ctx.fillStyle = heatColour(t);
-            ctx.fillRect(x * tileW, y * tileH, tileW, tileH);
-        }
-    }
-    // 7. Stair glyphs — draw "↕" over every Stair tile so they are distinguishable at a glance
+    // 8. Stair glyphs
     {
         const fontSize = Math.max(8, Math.min(tileW, tileH) * 0.65);
         ctx.save();
@@ -946,17 +986,20 @@ function paintGrid(ctx, config, grid, coverageTiles, heatmap, floorplanImg, plac
         for (let row = 0; row < grid_rows; row++) {
             for (let col = 0; col < grid_cols; col++) {
                 if ((grid[row]?.[col] ?? -1) === 6 /* TileType.Stair */) {
-                    ctx.fillText('↕', (col + 0.5) * tileW, (row + 0.5) * tileH);
+                    ctx.fillText('\u2195', (col + 0.5) * tileW, (row + 0.5) * tileH);
                 }
             }
         }
         ctx.restore();
     }
-    // 8. Sensor markers
+    // 9. Sensor markers
     const r = Math.min(tileW, tileH) * 0.38;
     for (const s of config.area_sensors ?? []) {
+        if (s.grid_x < 0 || s.grid_y < 0)
+            continue;
         const cx = (s.grid_x + 0.5) * tileW;
         const cy = (s.grid_y + 0.5) * tileH;
+        const isHovered = hoverTile?.x === s.grid_x && hoverTile?.y === s.grid_y;
         ctx.fillStyle = placing?.id === s.id ? 'rgba(0,220,255,0.6)' : 'rgba(0,180,255,0.85)';
         ctx.beginPath();
         ctx.arc(cx, cy, r, 0, Math.PI * 2);
@@ -964,10 +1007,20 @@ function paintGrid(ctx, config, grid, coverageTiles, heatmap, floorplanImg, plac
         ctx.strokeStyle = '#fff';
         ctx.lineWidth = 1.5;
         ctx.stroke();
+        if (isHovered) {
+            ctx.strokeStyle = 'rgba(255,80,80,0.9)';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.arc(cx, cy, r + 4, 0, Math.PI * 2);
+            ctx.stroke();
+        }
     }
     for (const s of config.point_sensors ?? []) {
+        if (s.tile_x < 0 || s.tile_y < 0)
+            continue;
         const cx = (s.tile_x + 0.5) * tileW;
         const cy = (s.tile_y + 0.5) * tileH;
+        const isHovered = hoverTile?.x === s.tile_x && hoverTile?.y === s.tile_y;
         ctx.fillStyle = placing?.id === s.id ? 'rgba(255,160,0,0.6)' : 'rgba(255,100,0,0.85)';
         ctx.beginPath();
         ctx.arc(cx, cy, r * 0.8, 0, Math.PI * 2);
@@ -975,8 +1028,15 @@ function paintGrid(ctx, config, grid, coverageTiles, heatmap, floorplanImg, plac
         ctx.strokeStyle = '#fff';
         ctx.lineWidth = 1.5;
         ctx.stroke();
+        if (isHovered) {
+            ctx.strokeStyle = 'rgba(255,80,80,0.9)';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.arc(cx, cy, r * 0.8 + 4, 0, Math.PI * 2);
+            ctx.stroke();
+        }
     }
-    // 8. Placement cursor hint
+    // 10. Placement cursor hint
     if (placing) {
         ctx.fillStyle = 'rgba(255,255,255,0.15)';
         ctx.fillRect(0, 0, width, height);
@@ -1074,82 +1134,90 @@ function backfillFloorIds(config) {
 }
 
 /**
- * Vector shape rasterization for the hspat vector draw mode.
- *
- * All public functions operate on integer tile coordinates.
- * Normalised [0, 1] coords are converted via normToTile before rasterization.
+ * Generates a display label for a stair tile shown in dropdowns and lists.
  */
-// ─── Coordinate helpers ───────────────────────────────────────────────────────
-/**
- * Convert a normalised [0, 1] coordinate to a tile index.
- * Clamps to grid bounds so callers never need to guard against out-of-range.
- */
-// ─── Bresenham line ───────────────────────────────────────────────────────────
-/**
- * Rasterize a line from tile (x0, y0) to (x1, y1) using Bresenham's algorithm.
- * thickness ≥ 1 expands the line perpendicular to its direction.
- * Returns a deduplicated list of tile coordinates.
- */
-function rasterizeLine(x0, y0, x1, y1, thickness) {
-    const spine = bresenham(x0, y0, x1, y1);
-    return dedup(spine);
+function stairLabel(stair, floor) {
+    if (stair.name)
+        return `${stair.name} (${floor.name})`;
+    return `Stair at (${stair.tile_x}, ${stair.tile_y}) on ${floor.name}`;
 }
-function bresenham(x0, y0, x1, y1) {
-    const tiles = [];
-    let dx = Math.abs(x1 - x0);
-    let dy = Math.abs(y1 - y0);
-    const sx = x0 < x1 ? 1 : -1;
-    const sy = y0 < y1 ? 1 : -1;
-    let err = dx - dy;
-    let cx = x0;
-    let cy = y0;
-    for (;;) {
-        tiles.push({ x: cx, y: cy });
-        if (cx === x1 && cy === y1)
-            break;
-        const e2 = 2 * err;
-        if (e2 > -dy) {
-            err -= dy;
-            cx += sx;
-        }
-        if (e2 < dx) {
-            err += dx;
-            cy += sy;
-        }
+/**
+ * Build the reciprocal StairTile so that a stair connection is bi-directional.
+ * Given stair A on floor `fromFloorId` pointing to floor B at (tx, ty),
+ * returns a StairTile suitable for insertion into floor B's `stair_tiles`.
+ */
+function buildReciprocalStair(source, fromFloorId) {
+    if (source.target_tile_x === undefined || source.target_tile_y === undefined) {
+        throw new Error('buildReciprocalStair: source stair has no target coordinates');
     }
-    return tiles;
+    return {
+        tile_x: source.target_tile_x,
+        tile_y: source.target_tile_y,
+        name: source.name,
+        target_floor_id: fromFloorId,
+        target_tile_x: source.tile_x,
+        target_tile_y: source.tile_y,
+        traversal_cost: source.traversal_cost,
+    };
 }
-// ─── Rectangle ───────────────────────────────────────────────────────────────
 /**
- * Rasterize a rectangle defined by two corner tiles.
- * filled=false → outline only; filled=true → all interior tiles included.
- * The two corners may be provided in any order.
+ * Upsert a stair tile into a floor's stair_tiles array.
+ * Matches by tile position. Returns the updated array (immutable).
  */
-function rasterizeRect(x0, y0, x1, y1, filled) {
-    const minX = Math.min(x0, x1);
-    const maxX = Math.max(x0, x1);
-    const minY = Math.min(y0, y1);
-    const maxY = Math.max(y0, y1);
-    const tiles = [];
-    for (let y = minY; y <= maxY; y++) {
-        for (let x = minX; x <= maxX; x++) {
-            if (x === minX || x === maxX || y === minY || y === maxY) {
-                tiles.push({ x, y });
-            }
-        }
-    }
-    return tiles; // already unique by construction
+function upsertStairTile(tiles, stair) {
+    const idx = tiles.findIndex(s => s.tile_x === stair.tile_x && s.tile_y === stair.tile_y);
+    return idx >= 0
+        ? tiles.map((s, i) => (i === idx ? stair : s))
+        : [...tiles, stair];
 }
-// ─── Internal utility ─────────────────────────────────────────────────────────
-function dedup(tiles) {
-    const seen = new Set();
-    return tiles.filter(({ x, y }) => {
-        const k = `${x},${y}`;
-        if (seen.has(k))
-            return false;
-        seen.add(k);
-        return true;
-    });
+
+/**
+ * Simple undo/redo manager for grid snapshots.
+ * Maintains two stacks (undo and redo) with a maximum depth of 50.
+ * Pushing a new snapshot clears the redo stack.
+ */
+class UndoManager {
+    constructor() {
+        this._undoStack = [];
+        this._redoStack = [];
+    }
+    get canUndo() {
+        return this._undoStack.length > 0;
+    }
+    get canRedo() {
+        return this._redoStack.length > 0;
+    }
+    /** Push a snapshot before a grid-modifying action. Clears the redo stack. */
+    push(snapshot) {
+        this._undoStack = [
+            ...this._undoStack.slice(-50 + 1),
+            snapshot,
+        ];
+        this._redoStack = [];
+    }
+    /** Undo: pop from undo stack, push to redo stack, return the snapshot. */
+    undo(currentSnapshot) {
+        if (this._undoStack.length === 0)
+            return null;
+        const prev = this._undoStack[this._undoStack.length - 1];
+        this._undoStack = this._undoStack.slice(0, -1);
+        this._redoStack = [...this._redoStack, currentSnapshot];
+        return prev;
+    }
+    /** Redo: pop from redo stack, push to undo stack, return the snapshot. */
+    redo(currentSnapshot) {
+        if (this._redoStack.length === 0)
+            return null;
+        const next = this._redoStack[this._redoStack.length - 1];
+        this._redoStack = this._redoStack.slice(0, -1);
+        this._undoStack = [...this._undoStack, currentSnapshot];
+        return next;
+    }
+    /** Clear both stacks. */
+    clear() {
+        this._undoStack = [];
+        this._redoStack = [];
+    }
 }
 
 let DisclaimerModal = class DisclaimerModal extends i {
@@ -1238,13 +1306,13 @@ let Toolbar = class Toolbar extends i {
         this.floors = [];
         this.activeFloorId = '';
         this.showGrid = true;
-        this.drawMode = 'pixel';
-        this.vectorShapeType = 'rect';
+        this.canUndo = false;
+        this.canRedo = false;
         this._modeLabels = {
-            setup: 'Setup',
-            paint: 'Draw Floor Plan',
-            hardware: 'Sensors',
-            audit: 'Audit',
+            setup: '\u2699 Setup',
+            paint: '\u270F Draw',
+            hardware: '\uD83D\uDCE1 Sensors',
+            audit: '\uD83D\uDEE1 Audit',
         };
     }
     _setMode(m) {
@@ -1272,23 +1340,21 @@ let Toolbar = class Toolbar extends i {
         this.showGrid = next;
         this.dispatchEvent(new CustomEvent('grid-toggle', { detail: next, bubbles: true, composed: true }));
     }
-    _setDrawMode(m) {
-        this.drawMode = m;
-        this.dispatchEvent(new CustomEvent('draw-mode-change', { detail: m, bubbles: true, composed: true }));
+    _undo() {
+        this.dispatchEvent(new CustomEvent('undo-action', { bubbles: true, composed: true }));
     }
-    _setVectorShape(t) {
-        this.vectorShapeType = t;
-        this.dispatchEvent(new CustomEvent('vector-shape-change', { detail: t, bubbles: true, composed: true }));
+    _redo() {
+        this.dispatchEvent(new CustomEvent('redo-action', { bubbles: true, composed: true }));
     }
     get _brushes() {
         return [
-            { type: 0 /* TileType.Open */, label: 'Open', colour: 'rgba(0,160,0,0.7)', tip: 'Walkable floor / open space' },
-            { type: 3 /* TileType.Wall */, label: 'Wall', colour: 'rgba(50,50,50,0.85)', tip: 'Solid wall — impassable' },
-            { type: 2 /* TileType.Door */, label: 'Door', colour: 'rgba(255,140,0,0.85)', tip: 'Door — entry point with higher cost' },
-            { type: 1 /* TileType.Window */, label: 'Window', colour: 'rgba(0,100,255,0.75)', tip: 'Window — breach point (lower cost than door)' },
-            { type: 4 /* TileType.Perimeter */, label: 'Perimeter', colour: 'rgba(200,0,0,0.8)', tip: 'Outer boundary — where an intruder could enter from' },
-            { type: 5 /* TileType.Valuable */, label: 'Valuable', colour: 'rgba(200,160,0,0.85)', tip: "Item worth protecting — the intruder's target" },
-            { type: 6 /* TileType.Stair */, label: 'Stairs', colour: 'rgba(139,92,246,0.85)', tip: 'Staircase — connects this floor to another floor' },
+            { type: 0 /* TileType.Open */, label: 'Open', colour: 'rgba(0,160,0,0.7)', tip: 'Interior walkable space (e.g. rooms, corridors). Intruders can move freely through these tiles.' },
+            { type: 3 /* TileType.Wall */, label: 'Wall', colour: 'rgba(50,50,50,0.85)', tip: 'Solid wall — impassable to intruders and blocks sensor line-of-sight.' },
+            { type: 2 /* TileType.Door */, label: 'Door', colour: 'rgba(255,140,0,0.85)', tip: 'Door tile — a passage point that costs more to move through. Attach a door sensor here.' },
+            { type: 1 /* TileType.Window */, label: 'Window', colour: 'rgba(0,100,255,0.75)', tip: 'Window tile — a breach point, easier to enter than a door. Attach a window sensor here.' },
+            { type: 4 /* TileType.Perimeter */, label: 'Perimeter', colour: 'rgba(200,0,0,0.8)', tip: 'Exterior boundary tile — marks where an intruder could enter from outside (e.g. an exterior wall face, garden edge). Unlike Open, these are potential starting points for the intruder simulation.' },
+            { type: 5 /* TileType.Valuable */, label: 'Valuable', colour: 'rgba(200,160,0,0.85)', tip: "High-value target tile (e.g. safe, server, jewellery). The simulation models intruders heading here from Perimeter tiles." },
+            { type: 6 /* TileType.Stair */, label: 'Stairs', colour: 'rgba(139,92,246,0.85)', tip: 'Staircase — connects this floor to another floor. After placing, link it to a stair on another floor.' },
         ];
     }
     render() {
@@ -1327,35 +1393,22 @@ let Toolbar = class Toolbar extends i {
         </div>
       </div>
 
-      <!-- Row 3: brush row + draw-mode toggle (paint mode only) -->
+      <!-- Row 3: brush row (paint mode only) -->
       ${this.mode === 'paint' ? b `
         <div class="row">
-          <div class="draw-mode-row">
+          <div class="undo-row">
             <button
-              class=${this.drawMode === 'pixel' ? 'active' : ''}
-              title="Paint individual tiles"
-              @click=${() => this._setDrawMode('pixel')}
-            >Pixel</button>
+              title="Undo (Ctrl+Z)"
+              ?disabled=${!this.canUndo}
+              @click=${this._undo}
+            >&#8617; Undo</button>
             <button
-              class=${this.drawMode === 'vector' ? 'active' : ''}
-              title="Draw vector shapes (auto-rasterized)"
-              @click=${() => this._setDrawMode('vector')}
-            >Vector</button>
+              title="Redo (Ctrl+Shift+Z)"
+              ?disabled=${!this.canRedo}
+              @click=${this._redo}
+            >&#8618; Redo</button>
           </div>
-          ${this.drawMode === 'vector' ? b `
-            <div class="draw-mode-row">
-              <button
-                class=${this.vectorShapeType === 'rect' ? 'active' : ''}
-                title="Draw filled rectangles"
-                @click=${() => this._setVectorShape('rect')}
-              >Rect</button>
-              <button
-                class=${this.vectorShapeType === 'line' ? 'active' : ''}
-                title="Draw lines"
-                @click=${() => this._setVectorShape('line')}
-              >Line</button>
-            </div>
-          ` : ''}
+          <div class="separator"></div>
           <div class="brush-row">
             ${this._brushes.map(b$1 => b `
               <button
@@ -1366,7 +1419,9 @@ let Toolbar = class Toolbar extends i {
               >${b$1.label}</button>
             `)}
           </div>
-          <span class="brush-legend" title=${this._brushes.find(b => b.type === this.brush)?.tip ?? ''}>
+        </div>
+        <div class="row">
+          <span class="brush-tooltip">
             ${this._brushes.find(b => b.type === this.brush)?.tip ?? ''}
           </span>
         </div>
@@ -1481,7 +1536,14 @@ Toolbar.styles = i$3 `
       border-color: var(--primary-color, #03a9f4);
       color: var(--primary-color, #03a9f4);
     }
-    .draw-mode-row {
+    .brush-tooltip {
+      font-size: 0.72rem;
+      color: var(--secondary-text-color, #888);
+      margin-top: 4px;
+      padding: 2px 4px;
+      line-height: 1.35;
+    }
+    .undo-row {
       display: flex;
       gap: 4px;
     }
@@ -1502,15 +1564,17 @@ __decorate([
     n({ type: Boolean })
 ], Toolbar.prototype, "showGrid", void 0);
 __decorate([
-    n()
-], Toolbar.prototype, "drawMode", void 0);
+    n({ type: Boolean })
+], Toolbar.prototype, "canUndo", void 0);
 __decorate([
-    n()
-], Toolbar.prototype, "vectorShapeType", void 0);
+    n({ type: Boolean })
+], Toolbar.prototype, "canRedo", void 0);
 Toolbar = __decorate([
     t('hspat-toolbar')
 ], Toolbar);
 
+/** Sentinel value meaning "sensor not yet placed on the map". */
+const UNPLACED = -1;
 let SensorForm = class SensorForm extends i {
     constructor() {
         super(...arguments);
@@ -1521,22 +1585,25 @@ let SensorForm = class SensorForm extends i {
         this._aFacing = 0;
         this._aFov = 110;
         this._aRange = 6;
+        this._aError = '';
         // Point sensor draft
         this._pEntityId = '';
         this._pBatteryId = '';
         this._pTileType = 2 /* TileType.Door */;
-        this._pX = 0;
-        this._pY = 0;
+        this._pError = '';
     }
     _addAreaSensor() {
-        if (!this._aEntityId.trim())
+        if (!this._aEntityId.trim()) {
+            this._aError = 'Entity ID is required. Find it in HA under Developer Tools → States.';
             return;
+        }
+        this._aError = '';
         const newSensor = {
             id: `area_${Date.now()}`,
             entity_id: this._aEntityId.trim(),
             battery_entity_id: this._aBatteryId.trim() || undefined,
-            grid_x: 0,
-            grid_y: 0,
+            grid_x: UNPLACED,
+            grid_y: UNPLACED,
             facing_angle: this._aFacing,
             fov_angle: this._aFov,
             max_range: this._aRange,
@@ -1544,6 +1611,8 @@ let SensorForm = class SensorForm extends i {
         this._fireConfigChange({
             area_sensors: [...this.config.area_sensors, newSensor],
         });
+        // Auto-enter placement mode so the user immediately clicks to place it
+        this._startPlacement(newSensor.id, 'area');
         this._aEntityId = '';
         this._aBatteryId = '';
     }
@@ -1553,19 +1622,24 @@ let SensorForm = class SensorForm extends i {
         });
     }
     _addPointSensor() {
-        if (!this._pEntityId.trim())
+        if (!this._pEntityId.trim()) {
+            this._pError = 'Entity ID is required. Find it in HA under Developer Tools → States.';
             return;
+        }
+        this._pError = '';
         const newSensor = {
             id: `point_${Date.now()}`,
             entity_id: this._pEntityId.trim(),
             battery_entity_id: this._pBatteryId.trim() || undefined,
-            tile_x: this._pX,
-            tile_y: this._pY,
+            tile_x: UNPLACED,
+            tile_y: UNPLACED,
             tile_type: this._pTileType,
         };
         this._fireConfigChange({
             point_sensors: [...this.config.point_sensors, newSensor],
         });
+        // Auto-enter placement mode
+        this._startPlacement(newSensor.id, 'point');
         this._pEntityId = '';
         this._pBatteryId = '';
     }
@@ -1600,8 +1674,8 @@ let SensorForm = class SensorForm extends i {
       </div>
       <p class="hint">
         ${this._tab === 'area'
-            ? 'Area sensors (motion detectors, cameras) watch a cone of space. Fill in the entity ID, then click "Place on map" to position the sensor on the floor plan.'
-            : 'Point sensors (door/window contacts) are attached to a single tile. Fill in the entity ID, choose the type, then click "Place on map" to position it.'}
+            ? 'Area sensors (motion detectors, cameras) watch a cone-shaped zone. After adding, click the map to place the sensor.'
+            : 'Point sensors (door/window contacts) are attached to a single door or window tile. After adding, click the map to place the sensor.'}
       </p>
 
       ${this._tab === 'area' ? this._renderAreaForm() : this._renderPointForm()}
@@ -1609,32 +1683,60 @@ let SensorForm = class SensorForm extends i {
     }
     _renderAreaForm() {
         return b `
-      <label>Entity ID (motion/camera)
-        <input .value=${this._aEntityId} @input=${(e) => { this._aEntityId = e.target.value; }} placeholder="binary_sensor.motion_hall" />
+      <label>Entity ID
+        <input .value=${this._aEntityId}
+          @input=${(e) => { this._aEntityId = e.target.value; this._aError = ''; }}
+          placeholder="binary_sensor.motion_hallway" />
       </label>
-      <label>Battery Entity ID (optional)
-        <input .value=${this._aBatteryId} @input=${(e) => { this._aBatteryId = e.target.value; }} placeholder="sensor.camera_battery" />
+      <p class="field-help">The Home Assistant entity ID of the motion or camera sensor (e.g. <em>binary_sensor.hallway_motion</em>). Find it under Developer Tools → States.</p>
+
+      <label>Battery Entity ID <em style="font-weight:normal;opacity:0.7">(optional)</em>
+        <input .value=${this._aBatteryId}
+          @input=${(e) => { this._aBatteryId = e.target.value; }}
+          placeholder="sensor.camera_battery" />
       </label>
-      <label>Facing Angle (0=East, 90=South)
-        <input type="number" min="0" max="359" .value=${String(this._aFacing)}
-          @change=${(e) => { this._aFacing = parseInt(e.target.value, 10); }} />
-      </label>
-      <label>FOV Angle (degrees)
-        <input type="number" min="1" max="360" .value=${String(this._aFov)}
-          @change=${(e) => { this._aFov = parseInt(e.target.value, 10); }} />
-      </label>
-      <label>Max Range (tiles)
-        <input type="number" min="1" max="50" .value=${String(this._aRange)}
-          @change=${(e) => { this._aRange = parseInt(e.target.value, 10); }} />
-      </label>
+      <p class="field-help">If set, this sensor is treated as offline during the audit when battery drops below 5%.</p>
+
+      <div class="numeric-row">
+        <div class="numeric-field">
+          <label>Facing °
+            <input type="number" min="0" max="359" .value=${String(this._aFacing)}
+              title="Direction the sensor faces: 0°=East, 90°=South, 180°=West, 270°=North"
+              @change=${(e) => { this._aFacing = parseInt(e.target.value, 10); }} />
+          </label>
+        </div>
+        <div class="numeric-field">
+          <label>FOV °
+            <input type="number" min="1" max="360" .value=${String(this._aFov)}
+              title="Total cone width. Most PIR sensors are 90°–120°."
+              @change=${(e) => { this._aFov = parseInt(e.target.value, 10); }} />
+          </label>
+        </div>
+        <div class="numeric-field">
+          <label>Range (tiles)
+            <input type="number" min="1" max="50" .value=${String(this._aRange)}
+              title="Detection distance in grid tiles (~0.5–1 m each)"
+              @change=${(e) => { this._aRange = parseInt(e.target.value, 10); }} />
+          </label>
+        </div>
+      </div>
+      <p class="field-help">Facing: 0°=East · 90°=South · FOV: cone width (PIR = 90°–120°) · Range: tiles (~0.5–1 m each)</p>
+
+      ${this._aError ? b `<p class="error-msg">${this._aError}</p>` : ''}
       <button class="add-btn" @click=${this._addAreaSensor}>Add Area Sensor</button>
 
       <div class="sensor-list">
         ${this.config.area_sensors.map(s => b `
           <div class="sensor-item">
-            <span>${s.entity_id} — ${s.fov_angle}° FOV @ (${s.grid_x},${s.grid_y})</span>
+            <div class="sensor-info">
+              <div class="sensor-name">
+                ${s.entity_id}
+                ${s.grid_x < 0 ? b `<span class="unplaced-badge">Not placed</span>` : b `<span style="opacity:0.6;font-size:0.75rem"> (${s.grid_x},${s.grid_y})</span>`}
+              </div>
+              <div style="opacity:0.6;font-size:0.75rem">${s.fov_angle}° FOV · range ${s.max_range}</div>
+            </div>
             <button class="place-btn" @click=${() => this._startPlacement(s.id, 'area')}>Place on map</button>
-            <button class="remove-btn" @click=${() => this._removeAreaSensor(s.id)}>×</button>
+            <button class="remove-btn" aria-label="Remove sensor ${s.entity_id}" @click=${() => this._removeAreaSensor(s.id)}>×</button>
           </div>
         `)}
       </div>
@@ -1642,34 +1744,43 @@ let SensorForm = class SensorForm extends i {
     }
     _renderPointForm() {
         return b `
-      <label>Entity ID (door/window contact)
-        <input .value=${this._pEntityId} @input=${(e) => { this._pEntityId = e.target.value; }} placeholder="binary_sensor.door_contact" />
+      <label>Entity ID
+        <input .value=${this._pEntityId}
+          @input=${(e) => { this._pEntityId = e.target.value; this._pError = ''; }}
+          placeholder="binary_sensor.front_door" />
       </label>
-      <label>Battery Entity ID (optional)
-        <input .value=${this._pBatteryId} @input=${(e) => { this._pBatteryId = e.target.value; }} placeholder="sensor.door_battery" />
+      <p class="field-help">The Home Assistant entity ID of the door/window contact sensor. It reports <em>on</em> when open, <em>off</em> when closed.</p>
+
+      <label>Battery Entity ID <em style="font-weight:normal;opacity:0.7">(optional)</em>
+        <input .value=${this._pBatteryId}
+          @input=${(e) => { this._pBatteryId = e.target.value; }}
+          placeholder="sensor.front_door_battery" />
       </label>
+      <p class="field-help">If set, the sensor is treated as offline during the audit when battery drops below 5%.</p>
+
       <label>Sensor Type
         <select @change=${(e) => { this._pTileType = parseInt(e.target.value, 10); }}>
           <option value=${2 /* TileType.Door */} ?selected=${this._pTileType === 2 /* TileType.Door */}>Door</option>
           <option value=${1 /* TileType.Window */} ?selected=${this._pTileType === 1 /* TileType.Window */}>Window</option>
         </select>
       </label>
-      <label>Tile X
-        <input type="number" min="0" .value=${String(this._pX)}
-          @change=${(e) => { this._pX = parseInt(e.target.value, 10); }} />
-      </label>
-      <label>Tile Y
-        <input type="number" min="0" .value=${String(this._pY)}
-          @change=${(e) => { this._pY = parseInt(e.target.value, 10); }} />
-      </label>
+      <p class="field-help">Whether this sensor is attached to a door tile or a window tile on the map.</p>
+
+      ${this._pError ? b `<p class="error-msg">${this._pError}</p>` : ''}
       <button class="add-btn" @click=${this._addPointSensor}>Add Point Sensor</button>
 
       <div class="sensor-list">
         ${this.config.point_sensors.map(s => b `
           <div class="sensor-item">
-            <span>${s.entity_id} — ${s.tile_type === 2 /* TileType.Door */ ? 'Door' : 'Window'} @ (${s.tile_x},${s.tile_y})</span>
+            <div class="sensor-info">
+              <div class="sensor-name">
+                ${s.entity_id}
+                ${s.tile_x < 0 ? b `<span class="unplaced-badge">Not placed</span>` : b `<span style="opacity:0.6;font-size:0.75rem"> (${s.tile_x},${s.tile_y})</span>`}
+              </div>
+              <div style="opacity:0.6;font-size:0.75rem">${s.tile_type === 2 /* TileType.Door */ ? 'Door' : 'Window'}</div>
+            </div>
             <button class="place-btn" @click=${() => this._startPlacement(s.id, 'point')}>Place on map</button>
-            <button class="remove-btn" @click=${() => this._removePointSensor(s.id)}>×</button>
+            <button class="remove-btn" aria-label="Remove sensor ${s.entity_id}" @click=${() => this._removePointSensor(s.id)}>×</button>
           </div>
         `)}
       </div>
@@ -1701,14 +1812,25 @@ SensorForm.styles = i$3 `
       margin-bottom: 4px;
       color: var(--primary-text-color);
     }
+    .field-help {
+      font-size: 0.75rem;
+      color: var(--secondary-text-color, #888);
+      margin: -6px 0 8px;
+      line-height: 1.35;
+    }
     input, select {
       width: 100%;
       padding: 6px;
       border: 1px solid var(--divider-color, #ccc);
       border-radius: 4px;
-      margin-bottom: 10px;
+      margin-bottom: 4px;
       box-sizing: border-box;
       font-size: 0.85rem;
+    }
+    .error-msg {
+      font-size: 0.78rem;
+      color: #f44336;
+      margin: 0 0 10px;
     }
     .add-btn {
       width: 100%;
@@ -1720,6 +1842,21 @@ SensorForm.styles = i$3 `
       cursor: pointer;
       font-size: 0.9rem;
     }
+    .numeric-row {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 4px;
+    }
+    .numeric-row .numeric-field {
+      flex: 1;
+      min-width: 0;
+    }
+    .numeric-row label {
+      margin-bottom: 2px;
+    }
+    .numeric-row input {
+      margin-bottom: 0;
+    }
     .sensor-list { margin-top: 12px; }
     .sensor-item {
       display: flex;
@@ -1730,7 +1867,21 @@ SensorForm.styles = i$3 `
       font-size: 0.82rem;
       gap: 6px;
     }
-    .sensor-item span { flex: 1; }
+    .sensor-info { flex: 1; min-width: 0; }
+    .sensor-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .unplaced-badge {
+      display: inline-block;
+      font-size: 0.7rem;
+      background: #ff9800;
+      color: #fff;
+      border-radius: 3px;
+      padding: 1px 5px;
+      margin-left: 4px;
+    }
     .place-btn {
       background: var(--primary-color, #03a9f4);
       color: #fff;
@@ -1773,6 +1924,9 @@ __decorate([
 ], SensorForm.prototype, "_aRange", void 0);
 __decorate([
     r()
+], SensorForm.prototype, "_aError", void 0);
+__decorate([
+    r()
 ], SensorForm.prototype, "_pEntityId", void 0);
 __decorate([
     r()
@@ -1782,10 +1936,7 @@ __decorate([
 ], SensorForm.prototype, "_pTileType", void 0);
 __decorate([
     r()
-], SensorForm.prototype, "_pX", void 0);
-__decorate([
-    r()
-], SensorForm.prototype, "_pY", void 0);
+], SensorForm.prototype, "_pError", void 0);
 SensorForm = __decorate([
     t('hspat-sensor-form')
 ], SensorForm);
@@ -1897,7 +2048,13 @@ ResultsPanel = __decorate([
 
 /**
  * Modal dialog for configuring a stair connection.
- * Fires 'stair-configured' with StairModalResult when the user confirms,
+ *
+ * The user gives the stair a name, sets the traversal cost, and optionally
+ * picks which existing stair on another floor this stair connects to.
+ * When a connection is selected the reciprocal entry is created automatically
+ * by the parent (hspat-card).
+ *
+ * Fires 'stair-configured' with StairModalResult on confirm,
  * or 'stair-cancelled' when dismissed.
  */
 let StairModal = class StairModal extends i {
@@ -1907,29 +2064,45 @@ let StairModal = class StairModal extends i {
         this.fromFloorId = '';
         this.tileX = 0;
         this.tileY = 0;
-        this._targetFloorId = '';
-        this._targetX = 0;
-        this._targetY = 0;
+        this._name = '';
         this._cost = 50;
+        /** Encoded as "floorId|tileX|tileY" or "" for no connection. */
+        this._selectedTarget = '';
     }
-    willUpdate() {
-        // Default target floor to the first floor that isn't the source
-        if (!this._targetFloorId) {
-            const other = this.floors.find(f => f.id !== this.fromFloorId);
-            if (other)
-                this._targetFloorId = other.id;
+    /** All stair tiles that exist on floors other than the source floor. */
+    get _availableTargets() {
+        const targets = [];
+        for (const floor of this.floors) {
+            if (floor.id === this.fromFloorId)
+                continue;
+            for (const stair of floor.stair_tiles) {
+                // Don't show the stair that already points back here (already connected)
+                if (stair.target_floor_id === this.fromFloorId
+                    && stair.target_tile_x === this.tileX
+                    && stair.target_tile_y === this.tileY)
+                    continue;
+                const key = `${floor.id}|${stair.tile_x}|${stair.tile_y}`;
+                targets.push({ key, label: stairLabel(stair, floor) });
+            }
         }
+        return targets;
     }
     _confirm() {
-        if (!this._targetFloorId)
-            return;
+        let target = {};
+        if (this._selectedTarget) {
+            const [floorId, tx, ty] = this._selectedTarget.split('|');
+            target = {
+                target_floor_id: floorId,
+                target_tile_x: Number(tx),
+                target_tile_y: Number(ty),
+            };
+        }
         const stairTile = {
             tile_x: this.tileX,
             tile_y: this.tileY,
-            target_floor_id: this._targetFloorId,
-            target_tile_x: this._targetX,
-            target_tile_y: this._targetY,
+            name: this._name.trim() || undefined,
             traversal_cost: this._cost,
+            ...target,
         };
         this.dispatchEvent(new CustomEvent('stair-configured', {
             detail: { stairTile, fromFloorId: this.fromFloorId },
@@ -1941,50 +2114,76 @@ let StairModal = class StairModal extends i {
         this.dispatchEvent(new CustomEvent('stair-cancelled', { bubbles: true, composed: true }));
     }
     render() {
-        const otherFloors = this.floors.filter(f => f.id !== this.fromFloorId);
+        const targets = this._availableTargets;
+        const hasOtherFloors = this.floors.some(f => f.id !== this.fromFloorId);
         return b `
       <div class="modal">
-        <h3>Configure Stair Connection</h3>
-        <p style="font-size:0.85rem;margin:0 0 12px;color:var(--secondary-text-color,#666)">
-          Tile (${this.tileX}, ${this.tileY}) on this floor connects to:
+        <h3>Configure Staircase</h3>
+        <p class="subtitle">
+          Stair tile at column ${this.tileX}, row ${this.tileY}
+          on ${this.floors.find(f => f.id === this.fromFloorId)?.name ?? 'this floor'}
         </p>
 
         <label>
-          <span>Target floor</span>
-          <select @change=${(e) => { this._targetFloorId = e.target.value; }}>
-            ${otherFloors.map(f => b `<option value=${f.id}>${f.name}</option>`)}
-          </select>
+          <span>Name <em style="font-weight:normal;opacity:0.7">(optional)</em></span>
+          <input
+            type="text"
+            .value=${this._name}
+            placeholder="e.g. Hallway stairs, Basement entrance"
+            @input=${(e) => { this._name = e.target.value; }}
+          />
+          <span class="hint">A name makes it easier to identify this stair in the connections list.</span>
         </label>
 
         <label>
-          <span>Target tile X</span>
-          <input type="number" min="0" .value=${String(this._targetX)}
-            @input=${(e) => { this._targetX = Number(e.target.value); }}>
+          <span>Traversal cost</span>
+          <input
+            type="number"
+            min="1"
+            .value=${String(this._cost)}
+            @input=${(e) => { this._cost = Number(e.target.value); }}
+          />
+          <span class="hint">How much extra effort it takes to use this staircase (higher = harder for an intruder). Default is 50.</span>
         </label>
 
-        <label>
-          <span>Target tile Y</span>
-          <input type="number" min="0" .value=${String(this._targetY)}
-            @input=${(e) => { this._targetY = Number(e.target.value); }}>
-        </label>
-
-        <label>
-          <span>Traversal cost (default 50)</span>
-          <input type="number" min="1" .value=${String(this._cost)}
-            @input=${(e) => { this._cost = Number(e.target.value); }}>
-        </label>
+        ${!hasOtherFloors ? b `
+          <div class="no-stairs-hint">
+            No other floors exist yet. Add another floor first, then place a stair there
+            to create a connection.
+          </div>
+        ` : targets.length === 0 ? b `
+          <div class="no-stairs-hint">
+            No unconnected stairs found on other floors. Place a stair tile on another
+            floor first — it will then appear in this list so you can link them.
+          </div>
+          <label>
+            <span>Connects to</span>
+            <select disabled>
+              <option>No stairs available on other floors</option>
+            </select>
+          </label>
+        ` : b `
+          <label>
+            <span>Connects to</span>
+            <select @change=${(e) => { this._selectedTarget = e.target.value; }}>
+              <option value="">— Not connected yet —</option>
+              ${targets.map(t => b `
+                <option value=${t.key} ?selected=${this._selectedTarget === t.key}>
+                  ${t.label}
+                </option>
+              `)}
+            </select>
+            <span class="hint">
+              Select which stair on another floor this staircase exits on.
+              The connection will be created automatically in both directions.
+            </span>
+          </label>
+        `}
 
         <div class="actions">
           <button class="cancel" @click=${this._cancel}>Cancel</button>
-          <button class="confirm" ?disabled=${!this._targetFloorId || otherFloors.length === 0}
-            @click=${this._confirm}>Connect</button>
+          <button class="confirm" @click=${this._confirm}>Save</button>
         </div>
-
-        ${otherFloors.length === 0 ? b `
-          <p style="color:#f44336;font-size:0.8rem;margin:8px 0 0">
-            Add at least one other floor before placing stairs.
-          </p>
-        ` : ''}
       </div>
     `;
     }
@@ -2003,12 +2202,24 @@ StairModal.styles = i$3 `
       background: var(--card-background-color, #fff);
       border-radius: 8px;
       padding: 24px;
-      min-width: 320px;
+      min-width: 340px;
+      max-width: 480px;
       box-shadow: 0 4px 32px rgba(0,0,0,0.3);
     }
-    h3 { margin: 0 0 16px; font-size: 1rem; }
+    h3 { margin: 0 0 8px; font-size: 1rem; }
+    .subtitle {
+      font-size: 0.8rem;
+      color: var(--secondary-text-color, #888);
+      margin: 0 0 16px;
+    }
     label { display: block; margin-bottom: 12px; font-size: 0.85rem; }
     label span { display: block; margin-bottom: 4px; color: var(--secondary-text-color, #666); }
+    label .hint {
+      display: block;
+      font-size: 0.75rem;
+      color: var(--secondary-text-color, #888);
+      margin-top: 2px;
+    }
     input, select {
       width: 100%;
       padding: 6px 8px;
@@ -2017,8 +2228,22 @@ StairModal.styles = i$3 `
       box-sizing: border-box;
       font-size: 0.9rem;
     }
+    .no-stairs-hint {
+      font-size: 0.8rem;
+      color: #ff9800;
+      background: rgba(255,152,0,0.1);
+      border-radius: 4px;
+      padding: 8px;
+      margin-bottom: 12px;
+    }
     .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
-    .actions button { padding: 8px 16px; border-radius: 4px; border: none; cursor: pointer; font-size: 0.85rem; }
+    .actions button {
+      padding: 8px 16px;
+      border-radius: 4px;
+      border: none;
+      cursor: pointer;
+      font-size: 0.85rem;
+    }
     .confirm { background: var(--primary-color, #03a9f4); color: #fff; }
     .cancel  { background: transparent; border: 1px solid var(--divider-color, #ccc) !important; }
   `;
@@ -2036,16 +2261,13 @@ __decorate([
 ], StairModal.prototype, "tileY", void 0);
 __decorate([
     r()
-], StairModal.prototype, "_targetFloorId", void 0);
-__decorate([
-    r()
-], StairModal.prototype, "_targetX", void 0);
-__decorate([
-    r()
-], StairModal.prototype, "_targetY", void 0);
+], StairModal.prototype, "_name", void 0);
 __decorate([
     r()
 ], StairModal.prototype, "_cost", void 0);
+__decorate([
+    r()
+], StairModal.prototype, "_selectedTarget", void 0);
 StairModal = __decorate([
     t('hspat-stair-modal')
 ], StairModal);
@@ -2060,9 +2282,9 @@ let HspatCard = class HspatCard extends i {
         this._placing = null;
         this._activeFloorId = '';
         this._showGrid = DEFAULT_SHOW_GRID;
-        this._drawMode = 'pixel';
         this._showStairModal = false;
         this._pendingStairCoords = { x: 0, y: 0 };
+        this._hoverTile = null;
         this._grid = [];
         this._canvas = null;
         this._ctx = null;
@@ -2071,11 +2293,7 @@ let HspatCard = class HspatCard extends i {
         this._gridDirty = false;
         this._worker = null;
         this._resizeObserver = null;
-        // Vector drawing state
-        this._vectorAnchor = null;
-        this._vectorPreviewEnd = null;
-        /** Current vector shape type; toolbar will expose a picker in Phase 7. */
-        this._vectorShapeType = 'rect';
+        this._undoManager = new UndoManager();
     }
     set hass(hass) {
         this._hass = hass;
@@ -2111,6 +2329,9 @@ let HspatCard = class HspatCard extends i {
         }
     }
     getCardSize() { return 6; }
+    getLayoutOptions() {
+        return { grid_columns: 4, grid_min_columns: 3, grid_rows: 'auto' };
+    }
     // ─── Active floor helpers ──────────────────────────────────────────────────
     get _activeFloor() {
         return this._config?.floors?.find(f => f.id === this._activeFloorId);
@@ -2189,6 +2410,9 @@ let HspatCard = class HspatCard extends i {
             this._redraw();
         });
         this._resizeObserver.observe(this);
+        // Undo/redo keyboard shortcuts
+        this.addEventListener('keydown', (e) => this._onKeyDown(e));
+        this.setAttribute('tabindex', '0');
     }
     _resizeCanvas() {
         if (!this._canvas)
@@ -2196,7 +2420,7 @@ let HspatCard = class HspatCard extends i {
         const floor = this._activeFloor;
         const cols = floor?.grid_cols ?? this._config?.grid_cols ?? DEFAULT_GRID_COLS;
         const rows = floor?.grid_rows ?? this._config?.grid_rows ?? DEFAULT_GRID_ROWS;
-        const w = this._canvas.offsetWidth;
+        const w = Math.min(this._canvas.offsetWidth, 1200);
         const h = Math.round(w * rows / cols);
         this._canvas.width = w;
         this._canvas.height = h;
@@ -2210,10 +2434,7 @@ let HspatCard = class HspatCard extends i {
         const floorAudit = this._auditResult?.per_floor.get(this._activeFloorId);
         const coverage = floorAudit?.coverage_tiles ?? this._auditResult?.coverage_tiles ?? new Set();
         const heatmap = floorAudit?.heatmap ?? this._auditResult?.heatmap ?? new Map();
-        paintGrid(this._ctx, this._config, this._grid, coverage, heatmap, this._floorplanImg, this._placing, this._showGrid);
-        if (this._drawMode === 'vector') {
-            this._drawVectorPreview();
-        }
+        paintGrid(this._ctx, this._config, this._grid, coverage, heatmap, this._floorplanImg, this._placing, this._showGrid, this._hoverTile);
     }
     // ─── Floor management ─────────────────────────────────────────────────────
     _switchFloor(id) {
@@ -2245,6 +2466,17 @@ let HspatCard = class HspatCard extends i {
         }
         this._rebuildGrid();
         this._resizeCanvas();
+        // Phase 3: update top-level audit data to the new floor's per-floor data
+        if (this._auditResult?.per_floor) {
+            const floorData = this._auditResult.per_floor.get(id);
+            if (floorData) {
+                this._auditResult = {
+                    ...this._auditResult,
+                    coverage_tiles: floorData.coverage_tiles,
+                    heatmap: floorData.heatmap,
+                };
+            }
+        }
         this._redraw();
         this._emitConfigChanged();
     }
@@ -2253,13 +2485,14 @@ let HspatCard = class HspatCard extends i {
             return;
         this._saveGridToFloor();
         const currentFloor = this._activeFloor;
+        const groundFloor = this._config.floors[0];
         const newId = `floor-${Date.now()}`;
         const newFloor = {
             id: newId,
             name: `Floor ${this._config.floors.length + 1}`,
-            grid_cols: currentFloor?.grid_cols ?? DEFAULT_GRID_COLS,
-            grid_rows: currentFloor?.grid_rows ?? DEFAULT_GRID_ROWS,
-            grid_rle: '',
+            grid_cols: groundFloor?.grid_cols ?? currentFloor?.grid_cols ?? DEFAULT_GRID_COLS,
+            grid_rows: groundFloor?.grid_rows ?? currentFloor?.grid_rows ?? DEFAULT_GRID_ROWS,
+            grid_rle: groundFloor?.grid_rle ?? '',
             area_sensors: [],
             point_sensors: [],
             valuables: [],
@@ -2280,6 +2513,66 @@ let HspatCard = class HspatCard extends i {
         this._activeFloorId = ''; // force re-switch even if switchTo === current
         this._switchFloor(switchTo);
     }
+    // ─── Undo / Redo ─────────────────────────────────────────────────────────
+    _captureSnapshot() {
+        const floor = this._activeFloor;
+        return {
+            grid_rle: encodeRLE(flatten(this._grid)),
+            perimeter: floor?.perimeter ?? this._config.perimeter ?? [],
+            valuables: floor?.valuables ?? this._config.valuables ?? [],
+        };
+    }
+    _applySnapshot(snapshot) {
+        const floor = this._activeFloor;
+        if (!floor || !this._config.floors)
+            return;
+        const flat = snapshot.grid_rle ? decodeRLE(snapshot.grid_rle) : new Array(floor.grid_cols * floor.grid_rows).fill(0 /* TileType.Open */);
+        this._grid = unflatten(flat, floor.grid_cols);
+        const updatedFloor = {
+            ...floor,
+            grid_rle: snapshot.grid_rle,
+            perimeter: snapshot.perimeter,
+            valuables: snapshot.valuables,
+        };
+        const floors = this._config.floors.map(f => f.id === floor.id ? updatedFloor : f);
+        this._config = {
+            ...this._config,
+            floors,
+            grid_rle: snapshot.grid_rle,
+            perimeter: snapshot.perimeter,
+            valuables: snapshot.valuables,
+        };
+    }
+    _undo() {
+        const current = this._captureSnapshot();
+        const prev = this._undoManager.undo(current);
+        if (!prev)
+            return;
+        this._applySnapshot(prev);
+        this._emitConfigChanged();
+        this._redraw();
+        this.requestUpdate();
+    }
+    _redo() {
+        const current = this._captureSnapshot();
+        const next = this._undoManager.redo(current);
+        if (!next)
+            return;
+        this._applySnapshot(next);
+        this._emitConfigChanged();
+        this._redraw();
+        this.requestUpdate();
+    }
+    _onKeyDown(e) {
+        if (e.ctrlKey && e.key === 'z' && !e.shiftKey) {
+            e.preventDefault();
+            this._undo();
+        }
+        else if (e.ctrlKey && (e.key === 'Z' || (e.shiftKey && e.key === 'z'))) {
+            e.preventDefault();
+            this._redo();
+        }
+    }
     // ─── Paint mode event handlers ───────────────────────────────────────────
     _onPointerDown(e) {
         if (this._mode === 'hardware' && this._placing) {
@@ -2290,107 +2583,73 @@ let HspatCard = class HspatCard extends i {
             return;
         if (this._brush === 6 /* TileType.Stair */) {
             const { x, y } = this._canvasTile(e);
+            this._undoManager.push(this._captureSnapshot());
             this._pendingStairCoords = { x, y };
             this._showStairModal = true;
             return;
         }
-        if (this._drawMode === 'vector') {
-            this._vectorAnchor = this._canvasTile(e);
-            this._vectorPreviewEnd = { ...this._vectorAnchor };
-            this._paintActive = true;
-            return;
-        }
+        this._undoManager.push(this._captureSnapshot());
         this._paintActive = true;
         this._applyBrush(e);
     }
     _onPointerMove(e) {
-        if (!this._paintActive || this._mode !== 'paint')
-            return;
-        if (this._drawMode === 'vector') {
-            this._vectorPreviewEnd = this._canvasTile(e);
+        if (this._mode === 'hardware') {
+            this._hoverTile = this._canvasTile(e);
             this._redraw();
             return;
         }
+        if (!this._paintActive || this._mode !== 'paint')
+            return;
         this._applyBrush(e);
     }
     _onPointerUp() {
-        if (this._paintActive && this._drawMode === 'vector' && this._vectorAnchor && this._vectorPreviewEnd) {
-            this._applyVectorShape(this._vectorAnchor, this._vectorPreviewEnd);
-            this._vectorAnchor = null;
-            this._vectorPreviewEnd = null;
-        }
-        else if (this._paintActive && this._gridDirty) {
+        if (this._paintActive && this._gridDirty) {
             this._gridDirty = false;
             this._saveGridToFloor();
             this._emitConfigChanged();
         }
         this._paintActive = false;
+        this.requestUpdate(); // update undo/redo button state
     }
-    /**
-     * Rasterize the current vector shape (anchor → end) into the grid, then save.
-     */
-    _applyVectorShape(a, b) {
-        const floor = this._activeFloor;
-        const cols = floor?.grid_cols ?? this._config.grid_cols;
-        const rows = floor?.grid_rows ?? this._config.grid_rows;
-        const tile = this._brush;
-        const tiles = this._vectorShapeType === 'rect'
-            ? rasterizeRect(a.x, a.y, b.x, b.y)
-            : rasterizeLine(a.x, a.y, b.x, b.y);
-        for (const { x, y } of tiles) {
-            if (x >= 0 && x < cols && y >= 0 && y < rows) {
-                if (this._grid[y])
-                    this._grid[y][x] = tile;
-            }
-        }
-        // Persist the shape as a SvgShape with normalised [0,1] coords
-        const shape = {
-            id: `shape-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-            type: this._vectorShapeType,
-            tile_type: this._brush,
-            points: [
-                [a.x / cols, a.y / rows],
-                [b.x / cols, b.y / rows],
-            ],
-            thickness: 1,
-        };
-        if (floor) {
-            floor.svg_shapes = [...(floor.svg_shapes ?? []), shape];
-        }
-        this._saveGridToFloor();
-        this._emitConfigChanged();
-        this._redraw();
+    _onPointerLeave() {
+        this._hoverTile = null;
+        this._onPointerUp();
     }
-    /**
-     * Draw a semi-transparent preview of the vector shape being dragged.
-     * Called after paintGrid so the preview appears on top.
-     */
-    _drawVectorPreview() {
-        if (!this._ctx || !this._vectorAnchor || !this._vectorPreviewEnd || !this._paintActive)
+    // ─── Phase 2: Right-click sensor deletion ─────────────────────────────────
+    _onContextMenu(e) {
+        if (this._mode !== 'hardware')
             return;
-        const { width, height } = this._ctx.canvas;
-        const floor = this._activeFloor;
-        const cols = floor?.grid_cols ?? this._config.grid_cols;
-        const rows = floor?.grid_rows ?? this._config.grid_rows;
-        const tileW = width / cols;
-        const tileH = height / rows;
-        const tiles = this._vectorShapeType === 'rect'
-            ? rasterizeRect(this._vectorAnchor.x, this._vectorAnchor.y, this._vectorPreviewEnd.x, this._vectorPreviewEnd.y)
-            : rasterizeLine(this._vectorAnchor.x, this._vectorAnchor.y, this._vectorPreviewEnd.x, this._vectorPreviewEnd.y);
-        this._ctx.save();
-        this._ctx.globalAlpha = 0.55;
-        this._ctx.fillStyle = TILE_COLOURS[this._brush] ?? '#888';
-        for (const { x, y } of tiles) {
-            this._ctx.fillRect(x * tileW, y * tileH, tileW, tileH);
-        }
-        // Highlight anchor tile
-        this._ctx.globalAlpha = 0.9;
-        this._ctx.strokeStyle = '#fff';
-        this._ctx.lineWidth = 2;
-        this._ctx.strokeRect(this._vectorAnchor.x * tileW + 1, this._vectorAnchor.y * tileH + 1, tileW - 2, tileH - 2);
-        this._ctx.restore();
+        e.preventDefault();
+        const { x, y } = this._canvasTile(e);
+        this._tryDeleteSensorAt(x, y);
     }
-    /** Bug 2 fix: use getBoundingClientRect so CSS px == canvas px always */
+    _tryDeleteSensorAt(x, y) {
+        const areaSensor = this._config.area_sensors.find(s => s.grid_x === x && s.grid_y === y);
+        if (areaSensor) {
+            if (!window.confirm(`Delete sensor "${areaSensor.entity_id}" at (${x}, ${y})?`))
+                return;
+            this._config = {
+                ...this._config,
+                area_sensors: this._config.area_sensors.filter(s => s.id !== areaSensor.id),
+            };
+            this._syncSensorsToActiveFloor();
+            this._emitConfigChanged();
+            this._redraw();
+            return;
+        }
+        const pointSensor = this._config.point_sensors.find(s => s.tile_x === x && s.tile_y === y);
+        if (pointSensor) {
+            if (!window.confirm(`Delete sensor "${pointSensor.entity_id}" at (${x}, ${y})?`))
+                return;
+            this._config = {
+                ...this._config,
+                point_sensors: this._config.point_sensors.filter(s => s.id !== pointSensor.id),
+            };
+            this._syncSensorsToActiveFloor();
+            this._emitConfigChanged();
+            this._redraw();
+        }
+    }
     _canvasTile(e) {
         const rect = this._canvas.getBoundingClientRect();
         const floor = this._activeFloor;
@@ -2453,12 +2712,27 @@ let HspatCard = class HspatCard extends i {
         }
         // Upsert the stair record and persist grid_rle atomically
         const rle = encodeRLE(flatten(this._grid));
-        const existingIdx = floor.stair_tiles.findIndex(s => s.tile_x === stairTile.tile_x && s.tile_y === stairTile.tile_y);
-        const updatedStairs = existingIdx >= 0
-            ? floor.stair_tiles.map((s, i) => i === existingIdx ? stairTile : s)
-            : [...floor.stair_tiles, stairTile];
-        const updatedFloor = { ...floor, grid_rle: rle, stair_tiles: updatedStairs };
-        const floors = this._config.floors.map(f => f.id === fromFloorId ? updatedFloor : f);
+        const updatedFloor = {
+            ...floor,
+            grid_rle: rle,
+            stair_tiles: upsertStairTile(floor.stair_tiles, stairTile),
+        };
+        let floors = this._config.floors.map(f => f.id === fromFloorId ? updatedFloor : f);
+        // Auto-create the reciprocal stair on the target floor so pathfinding is
+        // bi-directional without the user having to manually configure both ends.
+        if (stairTile.target_floor_id !== undefined
+            && stairTile.target_tile_x !== undefined
+            && stairTile.target_tile_y !== undefined) {
+            const targetFloor = floors.find(f => f.id === stairTile.target_floor_id);
+            if (targetFloor) {
+                const reciprocal = buildReciprocalStair(stairTile, fromFloorId);
+                const updatedTarget = {
+                    ...targetFloor,
+                    stair_tiles: upsertStairTile(targetFloor.stair_tiles, reciprocal),
+                };
+                floors = floors.map(f => f.id === stairTile.target_floor_id ? updatedTarget : f);
+            }
+        }
         this._config = { ...this._config, floors, grid_rle: rle };
         this._emitConfigChanged();
         this._showStairModal = false;
@@ -2495,80 +2769,78 @@ let HspatCard = class HspatCard extends i {
         this._redraw();
     }
     // ─── Audit ────────────────────────────────────────────────────────────────
+    _buildAuditBaseline(snapshots) {
+        const costMatrix = buildCostMatrix(this._grid, this._hass, this._config, snapshots);
+        applyAreaSensorCosts(costMatrix, this._grid, this._config.area_sensors, snapshots);
+        const coverageTiles = computeAllFov(this._grid, this._config.area_sensors, snapshots);
+        addPointSensorCoverage(this._config.point_sensors, snapshots, coverageTiles);
+        return { costMatrix, coverageTiles };
+    }
+    async _runMultiFloorAudit(snapshots, coverageTiles) {
+        const floors = this._config.floors;
+        const matrices = {};
+        const perFloor = new Map();
+        for (const floor of floors) {
+            const floorGrid = unflatten(decodeRLE(floor.grid_rle), floor.grid_cols);
+            const floorMatrix = buildCostMatrix(floorGrid, this._hass, { ...this._config, point_sensors: floor.point_sensors }, snapshots);
+            applyAreaSensorCosts(floorMatrix, floorGrid, floor.area_sensors, snapshots);
+            matrices[floor.id] = floorMatrix;
+            const floorCoverage = computeAllFov(floorGrid, floor.area_sensors, snapshots);
+            addPointSensorCoverage(floor.point_sensors, snapshots, floorCoverage);
+            perFloor.set(floor.id, { coverage_tiles: floorCoverage, heatmap: new Map() });
+        }
+        const rawHeatmap = await this._runMultiFloorWorker({
+            type: 'multi_floor',
+            floors: matrices,
+            stair_connections: this._buildStairConnections(floors),
+            perimeter: floors.flatMap(f => f.perimeter.map(p => ({ floor_id: f.id, x: p.x, y: p.y }))),
+            valuables: floors.flatMap(f => f.valuables.map(v => ({ floor_id: f.id, x: v.x, y: v.y }))),
+            iterations: SIMULATION_ITERS,
+        }).catch(() => new Map());
+        for (const [k, count] of rawHeatmap) {
+            const colonIdx = k.indexOf(':');
+            if (colonIdx < 0)
+                continue;
+            const bucket = perFloor.get(k.slice(0, colonIdx));
+            if (bucket)
+                bucket.heatmap.set(k.slice(colonIdx + 1), count);
+        }
+        const heatmap = perFloor.get(this._activeFloorId)?.heatmap ?? new Map();
+        return { heatmap, perFloor };
+    }
+    async _runSingleFloorAudit(costMatrix, coverageTiles) {
+        const heatmap = await this._runWorker({
+            cost_matrix: costMatrix,
+            perimeter: this._config.perimeter,
+            valuables: this._config.valuables,
+            iterations: SIMULATION_ITERS,
+        }).catch(() => new Map());
+        const perFloor = new Map([[this._activeFloorId, { coverage_tiles: coverageTiles, heatmap }]]);
+        return { heatmap, perFloor };
+    }
     async _runAudit() {
         if (!this._hass || this._running)
             return;
         this._running = true;
         this.requestUpdate();
         try {
+            this._syncSensorsToActiveFloor();
             const snapshots = takeSnapshot(this._hass, this._config.area_sensors, this._config.point_sensors);
-            const costMatrix = buildCostMatrix(this._grid, this._hass, this._config, snapshots);
-            applyAreaSensorCosts(costMatrix, this._grid, this._config.area_sensors, snapshots);
-            const coverageTiles = computeAllFov(this._grid, this._config.area_sensors, snapshots);
-            const floors = this._config.floors;
-            const isMultiFloor = floors && floors.length > 1;
-            let heatmap;
-            const perFloor = new Map();
-            if (isMultiFloor) {
-                // Build per-floor cost matrices and collect stair connections
-                const matrices = {};
-                const stairs = this._buildStairConnections(floors);
-                for (const floor of floors) {
-                    const floorGrid = unflatten(decodeRLE(floor.grid_rle), floor.grid_cols);
-                    const floorConfig = { ...this._config, point_sensors: floor.point_sensors };
-                    const floorMatrix = buildCostMatrix(floorGrid, this._hass, floorConfig, snapshots);
-                    applyAreaSensorCosts(floorMatrix, floorGrid, floor.area_sensors, snapshots);
-                    matrices[floor.id] = floorMatrix;
-                    const floorCoverage = computeAllFov(floorGrid, floor.area_sensors, snapshots);
-                    perFloor.set(floor.id, { coverage_tiles: floorCoverage, heatmap: new Map() });
-                }
-                // Build FloorPoint perimeter and valuables across all floors
-                const perimeterFP = floors.flatMap(f => f.perimeter.map(p => ({ floor_id: f.id, x: p.x, y: p.y })));
-                const valuablesFP = floors.flatMap(f => f.valuables.map(v => ({ floor_id: f.id, x: v.x, y: v.y })));
-                const rawHeatmap = await this._runMultiFloorWorker({
-                    type: 'multi_floor',
-                    floors: matrices,
-                    stair_connections: stairs,
-                    perimeter: perimeterFP,
-                    valuables: valuablesFP,
-                    iterations: SIMULATION_ITERS,
-                }).catch(() => new Map());
-                // Distribute heatmap entries into per_floor buckets
-                for (const [k, count] of rawHeatmap) {
-                    const colonIdx = k.indexOf(':');
-                    if (colonIdx < 0)
-                        continue;
-                    const floorId = k.slice(0, colonIdx);
-                    const tileKey = k.slice(colonIdx + 1); // "x,y"
-                    const bucket = perFloor.get(floorId);
-                    if (bucket)
-                        bucket.heatmap.set(tileKey, count);
-                }
-                // Active floor's heatmap for the top-level fields
-                heatmap = perFloor.get(this._activeFloorId)?.heatmap ?? new Map();
-            }
-            else {
-                // Single-floor path
-                heatmap = await this._runWorker({
-                    cost_matrix: costMatrix,
-                    perimeter: this._config.perimeter,
-                    valuables: this._config.valuables,
-                    iterations: SIMULATION_ITERS,
-                }).catch(() => new Map());
-                perFloor.set(this._activeFloorId, { coverage_tiles: coverageTiles, heatmap });
-            }
-            const insights = generateInsights(coverageTiles, heatmap);
+            const { costMatrix, coverageTiles } = this._buildAuditBaseline(snapshots);
+            const isMultiFloor = (this._config.floors?.length ?? 0) > 1;
+            const { heatmap, perFloor } = isMultiFloor
+                ? await this._runMultiFloorAudit(snapshots, coverageTiles)
+                : await this._runSingleFloorAudit(costMatrix, coverageTiles);
             this._auditResult = {
                 coverage_tiles: coverageTiles,
                 heatmap,
                 per_floor: perFloor,
                 sensor_snapshots: snapshots,
                 blind_spots: [],
-                insights,
+                insights: generateInsights(coverageTiles, heatmap),
             };
         }
         finally {
-            // Bug 3 + Bug 5 fix: always reset running state
             this._running = false;
             this._redraw();
             this.requestUpdate();
@@ -2579,6 +2851,11 @@ let HspatCard = class HspatCard extends i {
         const conns = [];
         for (const floor of floors) {
             for (const s of floor.stair_tiles) {
+                // Skip unconnected stairs (target not yet configured)
+                if (s.target_floor_id === undefined
+                    || s.target_tile_x === undefined
+                    || s.target_tile_y === undefined)
+                    continue;
                 conns.push({
                     from_floor: floor.id,
                     from_x: s.tile_x,
@@ -2681,6 +2958,67 @@ let HspatCard = class HspatCard extends i {
             detail: { config: this._config },
         }));
     }
+    // ─── Setup panel handlers ─────────────────────────────────────────────────
+    _onFloorNameChange(value) {
+        const floor = this._activeFloor;
+        if (!floor || !this._config.floors)
+            return;
+        const updatedFloor = { ...floor, name: value };
+        const floors = this._config.floors.map(f => f.id === floor.id ? updatedFloor : f);
+        this._config = { ...this._config, floors };
+        this._emitConfigChanged();
+        this.requestUpdate();
+    }
+    _onGridColsChange(value) {
+        const cols = Math.max(1, Math.min(200, parseInt(value, 10) || 1));
+        const floor = this._activeFloor;
+        if (!floor || !this._config.floors)
+            return;
+        const updatedFloor = { ...floor, grid_cols: cols };
+        const floors = this._config.floors.map(f => f.id === floor.id ? updatedFloor : f);
+        this._config = { ...this._config, floors, grid_cols: cols };
+        this._rebuildGrid();
+        this._resizeCanvas();
+        this._redraw();
+        this._emitConfigChanged();
+    }
+    _onGridRowsChange(value) {
+        const rows = Math.max(1, Math.min(200, parseInt(value, 10) || 1));
+        const floor = this._activeFloor;
+        if (!floor || !this._config.floors)
+            return;
+        const updatedFloor = { ...floor, grid_rows: rows };
+        const floors = this._config.floors.map(f => f.id === floor.id ? updatedFloor : f);
+        this._config = { ...this._config, floors, grid_rows: rows };
+        this._rebuildGrid();
+        this._resizeCanvas();
+        this._redraw();
+        this._emitConfigChanged();
+    }
+    /** Only allow http/https/absolute-path URLs to prevent javascript: URI injection. */
+    _isValidFloorplanUrl(url) {
+        return /^https?:\/\//i.test(url) || url.startsWith('/');
+    }
+    _onFloorplanUrlChange(value) {
+        const floor = this._activeFloor;
+        if (!floor || !this._config.floors)
+            return;
+        const raw = value.trim();
+        if (raw && !this._isValidFloorplanUrl(raw))
+            return;
+        const url = raw || undefined;
+        const updatedFloor = { ...floor, floorplan_url: url };
+        const floors = this._config.floors.map(f => f.id === floor.id ? updatedFloor : f);
+        this._config = { ...this._config, floors };
+        if (url) {
+            this._loadFloorplan(url);
+        }
+        else {
+            this._floorplanImg = null;
+            this._redraw();
+        }
+        this._emitConfigChanged();
+    }
     _onModeChange(e) {
         this._mode = e.detail;
         this.requestUpdate();
@@ -2693,9 +3031,6 @@ let HspatCard = class HspatCard extends i {
         this._config = { ...this._config, show_grid: this._showGrid };
         this._redraw();
         this._emitConfigChanged();
-    }
-    _onDrawModeChange(e) {
-        this._drawMode = e.detail;
     }
     render() {
         if (!this._config)
@@ -2711,33 +3046,48 @@ let HspatCard = class HspatCard extends i {
           .floors=${this._config.floors ?? []}
           .activeFloorId=${this._activeFloorId}
           .showGrid=${this._showGrid}
-          .drawMode=${this._drawMode}
-          .vectorShapeType=${this._vectorShapeType}
+          .canUndo=${this._undoManager.canUndo}
+          .canRedo=${this._undoManager.canRedo}
           @mode-change=${this._onModeChange}
           @brush-change=${this._onBrushChange}
           @floor-change=${(e) => this._switchFloor(e.detail)}
           @floor-add=${this._addFloor}
           @floor-delete=${(e) => this._deleteFloor(e.detail)}
           @grid-toggle=${this._onGridToggle}
-          @draw-mode-change=${this._onDrawModeChange}
-          @vector-shape-change=${(e) => { this._vectorShapeType = e.detail; }}
+          @undo-action=${this._undo}
+          @redo-action=${this._redo}
         ></hspat-toolbar>
 
-        <div class="canvas-wrapper">
-          <canvas
-            @pointerdown=${this._onPointerDown}
-            @pointermove=${this._onPointerMove}
-            @pointerup=${this._onPointerUp}
-            @pointerleave=${this._onPointerUp}
-          ></canvas>
+        <div class="content-row">
+          <div class="canvas-wrapper">
+            <canvas
+              role="application"
+              aria-label="Floor plan grid — use Draw Floor Plan mode to paint tiles"
+              @pointerdown=${this._onPointerDown}
+              @pointermove=${this._onPointerMove}
+              @pointerup=${this._onPointerUp}
+              @pointerleave=${this._onPointerLeave}
+              @contextmenu=${this._onContextMenu}
+            ></canvas>
 
-          ${showDisclaimer ? b `
-            <hspat-disclaimer-modal
-              .config=${this._config}
-              @config-changed=${this._onConfigChanged}
-            ></hspat-disclaimer-modal>
-          ` : ''}
+            ${showDisclaimer ? b `
+              <hspat-disclaimer-modal
+                .config=${this._config}
+                @config-changed=${this._onConfigChanged}
+              ></hspat-disclaimer-modal>
+            ` : ''}
+          </div>
         </div>
+
+        ${this._mode === 'hardware' || this._mode === 'audit' ? b `
+          <div class="side-panel">
+            ${this._mode === 'hardware' ? this._renderHardwarePanel() : ''}
+            ${this._mode === 'audit' ? this._renderAuditPanel() : ''}
+          </div>
+        ` : ''}
+
+        <!-- Status bar -->
+        <div class="status-bar">${this._renderStatusBar()}</div>
 
         ${this._showStairModal ? b `
           <hspat-stair-modal
@@ -2750,46 +3100,131 @@ let HspatCard = class HspatCard extends i {
           ></hspat-stair-modal>
         ` : ''}
 
-        ${this._mode === 'hardware' ? b `
-          <div class="panel">
-            ${this._placing ? b `
-              <p style="margin:0 0 8px;padding:8px;background:var(--primary-color,#03a9f4);color:#fff;border-radius:4px;font-size:0.85rem;">
-                Click anywhere on the map above to place the sensor, then it will snap to that tile.
-                <button @click=${() => { this._placing = null; this._redraw(); }}
-                  style="margin-left:8px;background:none;border:1px solid #fff;color:#fff;border-radius:4px;padding:2px 8px;cursor:pointer;">
-                  Cancel
-                </button>
-              </p>
-            ` : ''}
-            <hspat-sensor-form
-              .config=${this._config}
-              @config-changed=${this._onConfigChanged}
-              @place-sensor=${this._onPlaceSensor}
-            ></hspat-sensor-form>
-          </div>
-        ` : ''}
-
-        ${this._mode === 'audit' ? b `
-          <div class="panel">
-            ${this._running ? b `
-              <button
-                @click=${this._stopAudit}
-                style="padding:8px 16px;background:#f44336;color:#fff;border:none;border-radius:4px;cursor:pointer;margin-bottom:12px;"
-              >Stop</button>
-              <span style="margin-left:8px;font-size:0.85rem;color:var(--secondary-text-color);">Running simulation…</span>
-            ` : b `
-              <button
-                @click=${this._runAudit}
-                style="padding:8px 16px;background:var(--primary-color,#03a9f4);color:#fff;border:none;border-radius:4px;cursor:pointer;margin-bottom:12px;"
-              >Run Audit</button>
-            `}
-            <hspat-results-panel
-              .result=${this._auditResult}
-              .floors=${this._config.floors ?? []}
-            ></hspat-results-panel>
-          </div>
-        ` : ''}
+        ${this._mode === 'setup' ? this._renderSetupPanel() : ''}
       </ha-card>
+    `;
+    }
+    _renderStatusBar() {
+        const sensorCount = (this._config.area_sensors?.length ?? 0) + (this._config.point_sensors?.length ?? 0);
+        if (this._mode === 'hardware') {
+            const coords = this._hoverTile ? ` | Tile (${this._hoverTile.x}, ${this._hoverTile.y})` : '';
+            return `Sensors: ${sensorCount}${coords} | Right-click sensor to delete`;
+        }
+        if (this._mode === 'paint') {
+            const brushNames = {
+                0: 'Open', 3: 'Wall', 2: 'Door', 1: 'Window', 4: 'Perimeter', 5: 'Valuable', 6: 'Stairs',
+            };
+            const brushName = brushNames[this._brush] ?? 'Unknown';
+            const coords = this._hoverTile ? ` | Tile (${this._hoverTile.x}, ${this._hoverTile.y})` : '';
+            return `Brush: ${brushName}${coords}`;
+        }
+        if (this._mode === 'audit') {
+            return `Sensors: ${sensorCount}`;
+        }
+        return '';
+    }
+    _renderSetupPanel() {
+        return b `
+      <div class="setup-panel">
+        <div class="setup-section">
+          <h4>Floor settings</h4>
+          <div class="setup-field">
+            <label>Floor name</label>
+            <input
+              type="text"
+              .value=${this._activeFloor?.name ?? ''}
+              placeholder="e.g. Ground Floor, First Floor"
+              @change=${(e) => this._onFloorNameChange(e.target.value)}
+            />
+          </div>
+          <div class="setup-grid-row">
+            <div class="setup-field">
+              <label>Grid columns</label>
+              <input type="number" min="1" max="200"
+                .value=${String(this._activeFloor?.grid_cols ?? this._config.grid_cols)}
+                @change=${(e) => this._onGridColsChange(e.target.value)}
+              />
+              <div class="hint">Number of horizontal tiles.</div>
+            </div>
+            <div class="setup-field">
+              <label>Grid rows</label>
+              <input type="number" min="1" max="200"
+                .value=${String(this._activeFloor?.grid_rows ?? this._config.grid_rows)}
+                @change=${(e) => this._onGridRowsChange(e.target.value)}
+              />
+              <div class="hint">Number of vertical tiles.</div>
+            </div>
+          </div>
+        </div>
+        <div class="setup-section">
+          <h4>Background floorplan image</h4>
+          <div class="setup-field">
+            <label>Image URL</label>
+            <input
+              type="url"
+              .value=${this._activeFloor?.floorplan_url ?? ''}
+              placeholder="/local/floorplan/ground-floor.svg"
+              @change=${(e) => this._onFloorplanUrlChange(e.target.value)}
+            />
+            <div class="hint">
+              URL of an SVG or image file hosted in Home Assistant (e.g.
+              <code>/local/floorplan/ground.svg</code>). Use this to show a realistic
+              floor plan drawn in Inkscape or exported from Floorplanner as the background.
+              The tile grid overlay will appear on top so you can mark walls, doors, sensors
+              and other elements. Leave blank to use the plain tile grid only.
+            </div>
+          </div>
+          ${this._activeFloor?.floorplan_url ? b `
+            <img class="floorplan-preview"
+              src=${this._activeFloor.floorplan_url}
+              alt="Floorplan preview"
+              @error=${(e) => { e.target.style.display = 'none'; }}
+            />
+          ` : ''}
+        </div>
+      </div>
+    `;
+    }
+    _renderHardwarePanel() {
+        return b `
+      <div class="panel">
+        ${this._placing ? b `
+          <p style="margin:0 0 8px;padding:8px;background:var(--primary-color,#03a9f4);color:#fff;border-radius:4px;font-size:0.85rem;">
+            Click anywhere on the map above to place the sensor, then it will snap to that tile.
+            <button @click=${() => { this._placing = null; this._redraw(); }}
+              style="margin-left:8px;background:none;border:1px solid #fff;color:#fff;border-radius:4px;padding:2px 8px;cursor:pointer;">
+              Cancel
+            </button>
+          </p>
+        ` : ''}
+        <hspat-sensor-form
+          .config=${this._config}
+          @config-changed=${this._onConfigChanged}
+          @place-sensor=${this._onPlaceSensor}
+        ></hspat-sensor-form>
+      </div>
+    `;
+    }
+    _renderAuditPanel() {
+        return b `
+      <div class="panel">
+        ${this._running ? b `
+          <button
+            @click=${this._stopAudit}
+            style="padding:8px 16px;background:#f44336;color:#fff;border:none;border-radius:4px;cursor:pointer;margin-bottom:12px;"
+          >Stop</button>
+          <span style="margin-left:8px;font-size:0.85rem;color:var(--secondary-text-color);">Running simulation…</span>
+        ` : b `
+          <button
+            @click=${this._runAudit}
+            style="padding:8px 16px;background:var(--primary-color,#03a9f4);color:#fff;border:none;border-radius:4px;cursor:pointer;margin-bottom:12px;"
+          >Run Audit</button>
+        `}
+        <hspat-results-panel
+          .result=${this._auditResult}
+          .floors=${this._config.floors ?? []}
+        ></hspat-results-panel>
+      </div>
     `;
     }
     disconnectedCallback() {
@@ -2803,6 +3238,13 @@ HspatCard.styles = i$3 `
       display: block;
       position: relative;
       font-family: var(--paper-font-body1_-_font-family, sans-serif);
+      min-width: 600px;
+      max-width: 1200px;
+    }
+    @media (max-width: 600px) {
+      :host {
+        min-width: 100%;
+      }
     }
     ha-card {
       overflow: hidden;
@@ -2826,6 +3268,79 @@ HspatCard.styles = i$3 `
     }
     .panel {
       padding: 12px;
+    }
+    .setup-panel {
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .setup-section {
+      border: 1px solid var(--divider-color, #e0e0e0);
+      border-radius: 6px;
+      padding: 12px;
+    }
+    .setup-section h4 {
+      margin: 0 0 10px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: var(--primary-text-color);
+    }
+    .setup-field {
+      margin-bottom: 10px;
+    }
+    .setup-field:last-child {
+      margin-bottom: 0;
+    }
+    .setup-field label {
+      display: block;
+      font-size: 0.82rem;
+      color: var(--secondary-text-color, #666);
+      margin-bottom: 3px;
+    }
+    .setup-field input {
+      width: 100%;
+      padding: 6px 8px;
+      border: 1px solid var(--divider-color, #ccc);
+      border-radius: 4px;
+      box-sizing: border-box;
+      font-size: 0.9rem;
+    }
+    .setup-field .hint {
+      font-size: 0.75rem;
+      color: var(--secondary-text-color, #888);
+      margin-top: 3px;
+    }
+    .floorplan-preview {
+      margin-top: 6px;
+      width: 100%;
+      height: auto;
+      display: block;
+      object-fit: contain;
+      border-radius: 4px;
+      border: 1px solid var(--divider-color, #ccc);
+    }
+    .status-bar {
+      padding: 4px 10px;
+      font-size: 0.75rem;
+      color: var(--secondary-text-color, #888);
+      background: var(--card-background-color, #fff);
+      border-top: 1px solid var(--divider-color, #e0e0e0);
+      min-height: 1.5em;
+    }
+    .setup-grid-row {
+      display: flex;
+      gap: 10px;
+    }
+    .setup-grid-row .setup-field {
+      flex: 1;
+    }
+    .content-row {
+      display: block;
+    }
+    .side-panel {
+      width: 100%;
+      border-top: 1px solid var(--divider-color, #e0e0e0);
     }
   `;
 __decorate([
@@ -2857,13 +3372,13 @@ __decorate([
 ], HspatCard.prototype, "_showGrid", void 0);
 __decorate([
     r()
-], HspatCard.prototype, "_drawMode", void 0);
-__decorate([
-    r()
 ], HspatCard.prototype, "_showStairModal", void 0);
 __decorate([
     r()
 ], HspatCard.prototype, "_pendingStairCoords", void 0);
+__decorate([
+    r()
+], HspatCard.prototype, "_hoverTile", void 0);
 HspatCard = __decorate([
     t('hspat-card')
 ], HspatCard);

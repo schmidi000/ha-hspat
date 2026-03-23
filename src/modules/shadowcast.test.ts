@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { computeSensorFov, computeAllFov, applyAreaSensorCosts } from './shadowcast.js';
+import { computeSensorFov, computeAllFov, applyAreaSensorCosts, addPointSensorCoverage } from './shadowcast.js';
 import { TileType } from '../types.js';
 import { SENSOR_PENALTY } from '../constants.js';
-import type { AreaSensor, SensorSnapshot } from '../types.js';
+import type { AreaSensor, PointSensor, SensorSnapshot } from '../types.js';
 
 // 11x11 all-open grid for unobstructed FOV tests
 function openGrid(size = 11): number[][] {
@@ -142,5 +142,98 @@ describe('applyAreaSensorCosts', () => {
 
     // No tile should have the penalty
     expect(matrix[5]![6]).toBe(1);
+  });
+
+  it('does NOT add penalty for an unplaced area sensor (grid_x < 0)', () => {
+    const sensor = centredSensor({ grid_x: -1, fov_angle: 360, max_range: 4 });
+    const grid = openGrid(11);
+    const matrix = grid.map(row => row.map(() => 1));
+    const snaps: SensorSnapshot[] = [{ sensor_id: 's1', health: 'active' }];
+
+    applyAreaSensorCosts(matrix, grid, [sensor], snaps);
+
+    // Nothing should be modified
+    for (const row of matrix) {
+      for (const cell of row) {
+        expect(cell).toBe(1);
+      }
+    }
+  });
+});
+
+describe('addPointSensorCoverage', () => {
+  const makePointSensor = (overrides: Partial<PointSensor> = {}): PointSensor => ({
+    id: 'ps1',
+    entity_id: 'binary_sensor.door',
+    tile_x: 2,
+    tile_y: 3,
+    tile_type: TileType.Door,
+    ...overrides,
+  });
+
+  it('adds the tile of an active placed point sensor to coverage', () => {
+    const sensor = makePointSensor({ tile_x: 2, tile_y: 3 });
+    const snaps: SensorSnapshot[] = [{ sensor_id: 'ps1', health: 'active' }];
+    const coverage = new Set<string>();
+
+    addPointSensorCoverage([sensor], snaps, coverage);
+
+    expect(coverage.has('2,3')).toBe(true);
+  });
+
+  it('does NOT add tile for an offline sensor', () => {
+    const sensor = makePointSensor({ tile_x: 2, tile_y: 3 });
+    const snaps: SensorSnapshot[] = [{ sensor_id: 'ps1', health: 'offline' }];
+    const coverage = new Set<string>();
+
+    addPointSensorCoverage([sensor], snaps, coverage);
+
+    expect(coverage.has('2,3')).toBe(false);
+  });
+
+  it('does NOT add tile for an unplaced sensor (tile_x < 0)', () => {
+    const sensor = makePointSensor({ tile_x: -1, tile_y: 0 });
+    const snaps: SensorSnapshot[] = [{ sensor_id: 'ps1', health: 'active' }];
+    const coverage = new Set<string>();
+
+    addPointSensorCoverage([sensor], snaps, coverage);
+
+    expect(coverage.size).toBe(0);
+  });
+
+  it('does NOT add tile for an unplaced sensor (tile_y < 0)', () => {
+    const sensor = makePointSensor({ tile_x: 0, tile_y: -1 });
+    const snaps: SensorSnapshot[] = [{ sensor_id: 'ps1', health: 'active' }];
+    const coverage = new Set<string>();
+
+    addPointSensorCoverage([sensor], snaps, coverage);
+
+    expect(coverage.size).toBe(0);
+  });
+
+  it('adds multiple placed active sensors', () => {
+    const s1 = makePointSensor({ id: 'ps1', tile_x: 1, tile_y: 1 });
+    const s2 = makePointSensor({ id: 'ps2', tile_x: 4, tile_y: 2 });
+    const snaps: SensorSnapshot[] = [
+      { sensor_id: 'ps1', health: 'active' },
+      { sensor_id: 'ps2', health: 'active' },
+    ];
+    const coverage = new Set<string>();
+
+    addPointSensorCoverage([s1, s2], snaps, coverage);
+
+    expect(coverage.has('1,1')).toBe(true);
+    expect(coverage.has('4,2')).toBe(true);
+  });
+
+  it('does not clear pre-existing coverage entries', () => {
+    const sensor = makePointSensor({ tile_x: 2, tile_y: 3 });
+    const snaps: SensorSnapshot[] = [{ sensor_id: 'ps1', health: 'active' }];
+    const coverage = new Set<string>(['0,0', '1,1']);
+
+    addPointSensorCoverage([sensor], snaps, coverage);
+
+    expect(coverage.has('0,0')).toBe(true);
+    expect(coverage.has('2,3')).toBe(true);
   });
 });

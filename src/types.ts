@@ -53,9 +53,12 @@ export interface PerimeterTile { x: number; y: number; floor_id?: string; }
 export interface StairTile {
   tile_x: number;
   tile_y: number;
-  target_floor_id: string;
-  target_tile_x: number;
-  target_tile_y: number;
+  /** Human-readable label for this stair, shown in connection dropdowns. */
+  name?: string;
+  /** Undefined if this stair has not yet been connected to another stair. */
+  target_floor_id?: string;
+  target_tile_x?: number;
+  target_tile_y?: number;
   traversal_cost?: number; // defaults to STAIR_COST constant when omitted
 }
 

@@ -146,3 +146,35 @@ describe('buildCostMatrix — immutability', () => {
     expect(grid).toEqual(original);
   });
 });
+
+describe('buildCostMatrix — unplaced sensors (tile coords < 0)', () => {
+  it('ignores a point sensor with tile_x < 0', () => {
+    // Sensor not placed — tile_x is -1; should NOT apply any penalty or cost change
+    const config = makeConfig({
+      point_sensors: [{
+        id: 'ps1', entity_id: 'binary_sensor.door', tile_x: -1, tile_y: 1,
+        tile_type: TileType.Door,
+      }],
+    });
+    const snapshots: SensorSnapshot[] = [{ sensor_id: 'ps1', health: 'active' }];
+    const hass = makeHass({ 'binary_sensor.door': 'off' });
+
+    const matrix = buildCostMatrix(doorGrid, hass, config, snapshots);
+    // Should be base cost only — no penalty applied for the unplaced sensor
+    expect(matrix[1]![1]).toBe(BASE_COST[TileType.Door]);
+  });
+
+  it('ignores a point sensor with tile_y < 0', () => {
+    const config = makeConfig({
+      point_sensors: [{
+        id: 'ps1', entity_id: 'binary_sensor.door', tile_x: 1, tile_y: -1,
+        tile_type: TileType.Door,
+      }],
+    });
+    const snapshots: SensorSnapshot[] = [{ sensor_id: 'ps1', health: 'active' }];
+    const hass = makeHass({ 'binary_sensor.door': 'off' });
+
+    const matrix = buildCostMatrix(doorGrid, hass, config, snapshots);
+    expect(matrix[1]![1]).toBe(BASE_COST[TileType.Door]);
+  });
+});

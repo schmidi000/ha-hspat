@@ -4,6 +4,7 @@ node_modules/
 # Build cache & temp
 .rollup.cache/
 *.tsbuildinfo
+.claude/
 
 # TypeScript declaration emit (dist/ keeps only the bundled JS)
 dist/**/*.d.ts
